@@ -122,15 +122,9 @@ impl Driver {
             self.eng.reset(i);
             self.slots[i].cached.clear();
         }
-        let need = job.prompt.len() + 1;
-        let others = |slots: &[Slot]| slots.iter().enumerate().filter(|&(j, _)| j != i).map(|(_, s)| s.cached.len()).sum::<usize>();
-        for j in 0..self.slots.len() {
-            if j != i && self.slots[j].active.is_none() && others(&self.slots) + need > self.cfg.ctx {
-                self.eng.reset(j);
-                self.slots[j].cached.clear();
-            }
-        }
-        if job.prompt.is_empty() || others(&self.slots) + need > self.cfg.ctx {
+        // The prompt (beyond what the slot already holds) and one generated row must fit.
+        let need = job.prompt.len() - keep + 1;
+        if job.prompt.is_empty() || self.make_room(need, Some(i)) < need {
             let _ = job.tx.send(Event::Done(Done { finish_reason: "length", prompt_tokens: job.prompt.len(), cached_tokens: 0, completion_tokens: 0, prefill_s: 0.0, decode_s: 0.0, drafted: 0, accepted: 0 }));
             return;
         }
@@ -155,7 +149,13 @@ impl Driver {
 
     fn prefill(&mut self, i: usize, max_rows: usize) {
         let a = self.slots[i].active.as_ref().unwrap();
-        let chunk: Vec<u32> = a.job.prompt[a.fed..(a.fed + max_rows).min(a.job.prompt.len())].to_vec();
+        let want = max_rows.min(a.job.prompt.len() - a.fed);
+        let room = self.make_room(want, None);
+        if room == 0 {
+            return self.finish(i, "length");
+        }
+        let a = self.slots[i].active.as_ref().unwrap();
+        let chunk: Vec<u32> = a.job.prompt[a.fed..a.fed + want.min(room)].to_vec();
         let out = self.eng.step(&[(i, &chunk, true)]);
         let slot = &mut self.slots[i];
         slot.cached.extend(&chunk);
@@ -171,8 +171,18 @@ impl Driver {
     }
 
     fn decode(&mut self, slots: &[usize]) {
-        let lasts: Vec<(usize, u32)> = slots.iter().map(|&i| (i, self.slots[i].active.as_ref().unwrap().last.unwrap())).collect();
+        // Every row of the step takes a KV slot, accepted or not. Short of room, draft less;
+        // with no room for even one row each, the pool is full and the requests end.
         let n_draft = self.cfg.draft_n.min(BMAX / slots.len() - 1);
+        let room = self.make_room(slots.len() * (1 + n_draft), None);
+        if room < slots.len() {
+            for &i in slots {
+                self.finish(i, "length");
+            }
+            return;
+        }
+        let n_draft = n_draft.min(room / slots.len() - 1);
+        let lasts: Vec<(usize, u32)> = slots.iter().map(|&i| (i, self.slots[i].active.as_ref().unwrap().last.unwrap())).collect();
         let drafts = if n_draft > 0 { self.eng.draft(&lasts, n_draft) } else { vec![Vec::new(); slots.len()] };
         let rows: Vec<Vec<u32>> = lasts.iter().zip(&drafts).map(|(&(_, last), d)| std::iter::once(last).chain(d.iter().copied()).collect()).collect();
         let groups: Vec<(usize, &[u32], bool)> = slots.iter().zip(&rows).map(|(&i, r)| (i, r.as_slice(), false)).collect();
@@ -220,7 +230,7 @@ impl Driver {
                 a.pending.extend_from_slice(self.tok.decode_id(t));
             }
             a.last = Some(t);
-            if a.n_gen >= a.job.max_tokens || slot.cached.len() + used + 1 >= self.cfg.ctx {
+            if a.n_gen >= a.job.max_tokens {
                 finish = Some("length");
                 break;
             }
@@ -256,19 +266,41 @@ impl Driver {
             a.sent = upto;
         }
         if finish.is_some() || !ok {
-            let a = slot.active.take().unwrap();
-            let t_first = a.t_first.unwrap_or_else(Instant::now);
-            let _ = a.job.tx.send(Event::Done(Done {
-                finish_reason: finish.unwrap_or("abort"),
-                prompt_tokens: a.job.prompt.len(),
-                cached_tokens: a.cached_tokens,
-                completion_tokens: a.n_gen,
-                prefill_s: (t_first - a.t0).as_secs_f64(),
-                decode_s: t_first.elapsed().as_secs_f64(),
-                drafted: a.drafted,
-                accepted: a.accepted,
-            }));
+            self.finish(i, finish.unwrap_or("abort"));
         }
         used
+    }
+
+    /// End slot `i`'s request and report its totals. The slot keeps its cached state.
+    fn finish(&mut self, i: usize, reason: &'static str) {
+        let Some(a) = self.slots[i].active.take() else { return };
+        let t_first = a.t_first.unwrap_or_else(Instant::now);
+        let _ = a.job.tx.send(Event::Done(Done {
+            finish_reason: reason,
+            prompt_tokens: a.job.prompt.len(),
+            cached_tokens: a.cached_tokens,
+            completion_tokens: a.n_gen,
+            prefill_s: (t_first - a.t0).as_secs_f64(),
+            decode_s: t_first.elapsed().as_secs_f64(),
+            drafted: a.drafted,
+            accepted: a.accepted,
+        }));
+    }
+
+    /// Free KV slots: the pool is one, shared by every sequence.
+    fn free(&self) -> usize {
+        self.cfg.ctx - self.slots.iter().map(|s| s.cached.len()).sum::<usize>()
+    }
+
+    /// Try to have `rows` free KV slots by dropping the cached state of idle sequences
+    /// (largest first, never `keep`). Returns what is free afterwards.
+    fn make_room(&mut self, rows: usize, keep: Option<usize>) -> usize {
+        while self.free() < rows {
+            let idle = (0..self.slots.len()).filter(|&j| Some(j) != keep && self.slots[j].active.is_none() && !self.slots[j].cached.is_empty());
+            let Some(j) = idle.max_by_key(|&j| self.slots[j].cached.len()) else { break };
+            self.eng.reset(j);
+            self.slots[j].cached.clear();
+        }
+        self.free()
     }
 }

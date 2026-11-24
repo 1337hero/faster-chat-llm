@@ -78,7 +78,7 @@ run before and after):
 | Prefill at 131K / 259K prompt tokens (tok/s) | 1153 / 801 | 1357 / 1021 |
 | Time to first token, 19-token prompt | 185 ms | 87 ms |
 | Time to first token, 42 / 262 / 942-token prompt | 176 / 294 / 669 ms | 123 / 242 / 545 ms |
-| Start to ready | ~22 s | ~8 s |
+| Start to ready, warm page cache | 12.5 to 14 s | 7 to 8 s |
 
 Agreement with upstream llama.cpp on the same GGUF, teacher-forced over 2,991 positions: the
 top token matches 99.67% of the time and top-20 KL averages 0.00021. Two llama.cpp backends
