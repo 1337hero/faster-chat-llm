@@ -508,26 +508,33 @@ impl Engine {
                 hip::event_record(r.ev_done[h], r.s);
             }
         };
-        launch(0, 0);
-        launch(0, 1);
+        // Everything is queued up front; the runtime orders the streams. A half's partial is
+        // copied (side stream) once its stage is computed, and the half's next stage (main
+        // stream, both cards) starts once both copies have landed.
         for k in 0..stages {
             for h in 0..2 {
-                // Stage k of this half is computed: ship its partial, and as soon as it lands
-                // queue the half's next stage behind whatever the other half is running.
+                if k > 0 {
+                    for (i, r) in self.ranks.iter().enumerate() {
+                        hip::set_device(r.dev);
+                        hip::stream_wait_event(r.s, self.ranks[1 - i].ev_copied[h]);
+                    }
+                }
+                launch(k, h);
                 for r in &self.ranks {
-                    hip::event_wait(r.ev_done[h]);
+                    hip::set_device(r.dev);
+                    hip::stream_wait_event(r.sx, r.ev_done[h]);
                 }
                 self.peer_copy(k % 2 == 0, halves[h], true);
                 for r in &self.ranks {
                     hip::set_device(r.dev);
                     hip::event_record(r.ev_copied[h], r.sx);
                 }
-                for r in &self.ranks {
-                    hip::event_wait(r.ev_copied[h]);
-                }
-                if k + 1 < stages {
-                    launch(k + 1, h);
-                }
+            }
+        }
+        for h in 0..2 {
+            for (i, r) in self.ranks.iter().enumerate() {
+                hip::set_device(r.dev);
+                hip::stream_wait_event(r.s, self.ranks[1 - i].ev_copied[h]);
             }
         }
     }

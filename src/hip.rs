@@ -66,6 +66,7 @@ unsafe extern "C" {
     fn hipEventCreate(e: *mut Event) -> c_int;
     fn hipEventRecord(e: Event, s: Stream) -> c_int;
     fn hipEventSynchronize(e: Event) -> c_int;
+    fn hipStreamWaitEvent(s: Stream, e: Event, flags: u32) -> c_int;
     fn hipMemGetInfo(free: *mut usize, total: *mut usize) -> c_int;
     fn hipGetErrorString(e: c_int) -> *const c_char;
 }
@@ -123,6 +124,11 @@ pub fn event_create() -> Event {
 /// Mark the current tail of stream `s`; `event_wait` returns once everything before it is done.
 pub fn event_record(e: Event, s: Stream) {
     unsafe { ck(hipEventRecord(e, s)) }
+}
+
+/// Make everything queued on `s` from now on wait for the point `e` marks (on any stream).
+pub fn stream_wait_event(s: Stream, e: Event) {
+    unsafe { ck(hipStreamWaitEvent(s, e, 0)) }
 }
 
 pub fn event_wait(e: Event) {
