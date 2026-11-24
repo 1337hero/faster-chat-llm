@@ -25,9 +25,43 @@ impl ChatTemplate {
     /// (e.g. `enable_thinking`); `tools` is passed through untouched.
     pub fn render(&self, messages: &Value, tools: Option<&Value>, kwargs: &serde_json::Map<String, Value>) -> Result<String, String> {
         let tmpl = self.env.get_template("chat").map_err(|e| e.to_string())?;
+        let messages = &with_object_arguments(messages);
         use minijinja::value::Serde;
         let base = context! { messages => Serde(messages), tools => Serde(tools), add_generation_prompt => true };
         let extra = minijinja::Value::from(Serde(kwargs));
         tmpl.render(context! { ..extra, ..base }).map_err(|e| format!("chat template: {e:#}"))
+    }
+}
+
+/// OpenAI clients send a tool call's `arguments` as a JSON string; the template iterates them
+/// as a mapping. Parse the strings so both forms render the same.
+fn with_object_arguments(messages: &Value) -> Value {
+    let mut messages = messages.clone();
+    for call in messages.as_array_mut().into_iter().flatten().filter_map(|m| m.get_mut("tool_calls")).filter_map(Value::as_array_mut).flatten() {
+        let target = if call.get("function").is_some() { &mut call["function"] } else { call };
+        if let Some(parsed) = target.get("arguments").and_then(Value::as_str).and_then(|s| serde_json::from_str::<Value>(s).ok()) {
+            if parsed.is_object() {
+                target["arguments"] = parsed;
+            }
+        }
+    }
+    messages
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn string_arguments_become_objects() {
+        let msgs = json!([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "tool_calls": [{"id": "a", "type": "function", "function": {"name": "f", "arguments": "{\"city\": \"Paris\"}"}}]},
+            {"role": "assistant", "tool_calls": [{"function": {"name": "g", "arguments": {"n": 1}}}]},
+        ]);
+        let out = with_object_arguments(&msgs);
+        assert_eq!(out[1]["tool_calls"][0]["function"]["arguments"], json!({"city": "Paris"}));
+        assert_eq!(out[2]["tool_calls"][0]["function"]["arguments"], json!({"n": 1}));
     }
 }

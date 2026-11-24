@@ -195,338 +195,187 @@ fn usage(d: &Done) -> Value {
     })
 }
 
+/// The finished output items of a response: optional reasoning, the message, then tool calls.
+fn output_items(reasoning: &str, content: &str, calls: &[ToolCall]) -> Vec<Value> {
+    let mut output = Vec::new();
+    if !reasoning.is_empty() {
+        output.push(json!({
+            "type": "reasoning", "id": format!("rs_{}", output.len()),
+            "summary": [{"type": "summary_text", "text": reasoning}]
+        }));
+    }
+    if !content.is_empty() || calls.is_empty() {
+        output.push(json!({
+            "type": "message", "id": format!("msg_{}", output.len()), "role": "assistant", "status": "completed",
+            "content": [{"type": "output_text", "text": content, "annotations": []}]
+        }));
+    }
+    for call in calls {
+        output.push(json!({
+            "type": "function_call", "id": format!("fc_{}", output.len()), "status": "completed",
+            "call_id": call.id, "name": call.name, "arguments": call.arguments.to_string()
+        }));
+    }
+    output
+}
+
+fn response_object(id: &str, model: &str, status: &str, output: Vec<Value>, usage: Value) -> Value {
+    json!({
+        "id": id, "object": "response", "created_at": created_at(), "status": status, "model": model,
+        "output": output, "usage": usage,
+        "parallel_tool_calls": true, "tool_choice": "auto", "tools": [],
+    })
+}
+
+fn created_at() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
 /// Handle non-streaming response.
-pub fn handle_sync(
-    rx: Receiver<Event>,
-    model: &str,
-    thinking_enabled: bool,
-    _has_tools: bool,
-) -> Value {
+pub fn handle_sync(rx: Receiver<Event>, model: &str, thinking_enabled: bool, _has_tools: bool) -> Value {
     let id = gen_id();
     let mut split = ThinkSplit::new(thinking_enabled);
     let mut tool_parser = ToolCallParser::new();
-
-    let (mut reasoning, mut content) = (String::new(), String::new());
+    let (mut reasoning, mut content, mut calls) = (String::new(), String::new(), Vec::new());
     let mut done_info = None;
+    for ev in rx {
+        match ev {
+            Event::Text(t) => {
+                let (r, c) = split.push(&t, false);
+                reasoning.push_str(&r);
+                let (safe, found) = tool_parser.push(&c, false);
+                content.push_str(&safe);
+                calls.extend(found);
+            }
+            Event::Done(d) => done_info = Some(d),
+        }
+    }
+    let (r, c) = split.push("", true);
+    reasoning.push_str(&r);
+    let (safe, found) = tool_parser.push(&c, true);
+    content.push_str(&safe);
+    calls.extend(found);
+    let Some(d) = done_info else {
+        return openai_error("engine stopped", "server_error", None);
+    };
+    response_object(&id, model, "completed", output_items(&reasoning, &content, &calls), usage(&d))
+}
+
+/// Handle streaming response with semantic events. Text streams as it arrives; reasoning and
+/// tool calls are announced as whole items once known.
+#[allow(unused_assignments)] // the macro's last expansion sets a flag nothing reads afterwards
+pub fn handle_stream(mut conn: TcpStream, rx: Receiver<Event>, model: &str, thinking_enabled: bool, _has_tools: bool) -> std::io::Result<()> {
+    let id = gen_id();
+    write!(conn, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n")?;
+
+    let mut seq = 0u64;
+    let mut send = |conn: &mut TcpStream, event: &str, mut data: Value| -> std::io::Result<()> {
+        data["type"] = json!(event);
+        data["sequence_number"] = json!(seq);
+        seq += 1;
+        write!(conn, "event: {event}\ndata: {data}\n\n")?;
+        conn.flush()
+    };
+
+    let skeleton = response_object(&id, model, "in_progress", Vec::new(), Value::Null);
+    send(&mut conn, "response.created", json!({"response": skeleton}))?;
+    send(&mut conn, "response.in_progress", json!({"response": skeleton}))?;
+
+    let mut split = ThinkSplit::new(thinking_enabled);
+    let mut tool_parser = ToolCallParser::new();
+    let (mut reasoning, mut content, mut calls) = (String::new(), String::new(), Vec::<ToolCall>::new());
+    // Output index of the message item once its first text has been sent.
+    let mut message_at: Option<usize> = None;
+    let mut next_index = 0usize;
+    let mut done_info = None;
+
+    // Reasoning ends before the answer starts, so it can be emitted as one finished item the
+    // moment the first answer text (or the end) arrives.
+    let mut reasoning_sent = false;
+    macro_rules! flush_reasoning {
+        () => {
+            if !reasoning_sent && !reasoning.is_empty() {
+                let item = json!({"type": "reasoning", "id": format!("rs_{next_index}"), "summary": [{"type": "summary_text", "text": reasoning}]});
+                send(&mut conn, "response.output_item.added", json!({"output_index": next_index, "item": {"type": "reasoning", "id": format!("rs_{next_index}"), "summary": []}}))?;
+                send(&mut conn, "response.output_item.done", json!({"output_index": next_index, "item": item}))?;
+                next_index += 1;
+            }
+            reasoning_sent = true;
+        };
+    }
+    macro_rules! text_delta {
+        ($text:expr) => {
+            if !$text.is_empty() {
+                flush_reasoning!();
+                let at = match message_at {
+                    Some(at) => at,
+                    None => {
+                        let at = next_index;
+                        next_index += 1;
+                        message_at = Some(at);
+                        send(&mut conn, "response.output_item.added", json!({"output_index": at, "item": {"type": "message", "id": format!("msg_{at}"), "role": "assistant", "status": "in_progress", "content": []}}))?;
+                        send(&mut conn, "response.content_part.added", json!({"item_id": format!("msg_{at}"), "output_index": at, "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": []}}))?;
+                        at
+                    }
+                };
+                send(&mut conn, "response.output_text.delta", json!({"item_id": format!("msg_{at}"), "output_index": at, "content_index": 0, "delta": $text, "logprobs": []}))?;
+                content.push_str(&$text);
+            }
+        };
+    }
 
     for ev in rx {
         match ev {
             Event::Text(t) => {
                 let (r, c) = split.push(&t, false);
                 reasoning.push_str(&r);
-                let (safe, _) = tool_parser.push(&c, false);
-                content.push_str(&safe);
+                let (safe, found) = tool_parser.push(&c, false);
+                calls.extend(found);
+                text_delta!(safe);
             }
             Event::Done(d) => done_info = Some(d),
         }
     }
-
     let (r, c) = split.push("", true);
     reasoning.push_str(&r);
-    let (safe, calls) = tool_parser.push(&c, true);
-    content.push_str(&safe);
+    let (safe, found) = tool_parser.push(&c, true);
+    calls.extend(found);
+    text_delta!(safe);
+    flush_reasoning!();
 
-    let Some(d) = done_info else {
-        return openai_error("engine stopped", "server_error", None);
-    };
-
-    // Build output items
+    let Some(d) = done_info else { return Ok(()) };
+    // A response with no text and no tool calls still carries an (empty) message.
+    if message_at.is_none() && calls.is_empty() {
+        let at = next_index;
+        next_index += 1;
+        message_at = Some(at);
+        send(&mut conn, "response.output_item.added", json!({"output_index": at, "item": {"type": "message", "id": format!("msg_{at}"), "role": "assistant", "status": "in_progress", "content": []}}))?;
+        send(&mut conn, "response.content_part.added", json!({"item_id": format!("msg_{at}"), "output_index": at, "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": []}}))?;
+    }
     let mut output = Vec::new();
-    let mut item_idx = 0;
-
-    // Reasoning item (if present)
-    if !reasoning.is_empty() && thinking_enabled {
-        output.push(json!({
-            "type": "reasoning",
-            "id": format!("item_{}", item_idx),
-            "summary": [{
-                "type": "summary_text",
-                "text": reasoning
-            }]
-        }));
-        item_idx += 1;
+    if !reasoning.is_empty() {
+        output.push(json!({"type": "reasoning", "id": format!("rs_{}", output.len()), "summary": [{"type": "summary_text", "text": reasoning}]}));
     }
-
-    // Message item with text
-    if !content.is_empty() || calls.is_empty() {
-        output.push(json!({
-            "type": "message",
-            "id": format!("item_{}", item_idx),
-            "role": "assistant",
-            "content": [{
-                "type": "output_text",
-                "text": content
-            }]
-        }));
-        item_idx += 1;
+    if let Some(at) = message_at {
+        let part = json!({"type": "output_text", "text": content, "annotations": []});
+        let item = json!({"type": "message", "id": format!("msg_{at}"), "role": "assistant", "status": "completed", "content": [part]});
+        send(&mut conn, "response.output_text.done", json!({"item_id": format!("msg_{at}"), "output_index": at, "content_index": 0, "text": content, "logprobs": []}))?;
+        send(&mut conn, "response.content_part.done", json!({"item_id": format!("msg_{at}"), "output_index": at, "content_index": 0, "part": part}))?;
+        send(&mut conn, "response.output_item.done", json!({"output_index": at, "item": item}))?;
+        output.push(item);
     }
-
-    // Function call items
     for call in &calls {
-        output.push(json!({
-            "type": "function_call",
-            "id": format!("item_{}", item_idx),
-            "call_id": call.id,
-            "name": call.name,
-            "arguments": call.arguments.to_string()
-        }));
-        item_idx += 1;
+        let at = next_index;
+        next_index += 1;
+        let args = call.arguments.to_string();
+        let item = json!({"type": "function_call", "id": format!("fc_{at}"), "status": "completed", "call_id": call.id, "name": call.name, "arguments": args});
+        send(&mut conn, "response.output_item.added", json!({"output_index": at, "item": {"type": "function_call", "id": format!("fc_{at}"), "status": "in_progress", "call_id": call.id, "name": call.name, "arguments": ""}}))?;
+        send(&mut conn, "response.function_call_arguments.delta", json!({"item_id": format!("fc_{at}"), "output_index": at, "delta": args}))?;
+        send(&mut conn, "response.function_call_arguments.done", json!({"item_id": format!("fc_{at}"), "output_index": at, "name": call.name, "arguments": args}))?;
+        send(&mut conn, "response.output_item.done", json!({"output_index": at, "item": item}))?;
+        output.push(item);
     }
-
-    let status = if !calls.is_empty() { "incomplete" } else { "completed" };
-
-    json!({
-        "id": id,
-        "object": "response",
-        "status": status,
-        "model": model,
-        "output": output,
-        "usage": usage(&d)
-    })
-}
-
-/// Handle streaming response with semantic events.
-pub fn handle_stream(
-    mut conn: TcpStream,
-    rx: Receiver<Event>,
-    model: &str,
-    thinking_enabled: bool,
-    _has_tools: bool,
-) -> std::io::Result<()> {
-    let id = gen_id();
-
-    write!(conn, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n")?;
-
-    let send = |conn: &mut TcpStream, event: &str, data: &Value| -> std::io::Result<()> {
-        write!(conn, "event: {event}\ndata: {data}\n\n")?;
-        conn.flush()
-    };
-
-    // response.created
-    send(&mut conn, "response.created", &json!({
-        "type": "response.created",
-        "response": {"id": id, "object": "response", "status": "in_progress", "model": model}
-    }))?;
-
-    // response.in_progress
-    send(&mut conn, "response.in_progress", &json!({
-        "type": "response.in_progress",
-        "response": {"id": id, "status": "in_progress"}
-    }))?;
-
-    let mut split = ThinkSplit::new(thinking_enabled);
-    let mut tool_parser = ToolCallParser::new();
-
-    let mut item_idx = 0;
-    let mut reasoning_started = false;
-    let mut message_started = false;
-    let mut all_calls: Vec<ToolCall> = Vec::new();
-
-    for ev in rx {
-        match ev {
-            Event::Text(t) => {
-                let (r, c) = split.push(&t, false);
-
-                // Emit reasoning deltas
-                if !r.is_empty() && thinking_enabled {
-                    if !reasoning_started {
-                        // Start reasoning item
-                        send(&mut conn, "response.output_item.added", &json!({
-                            "type": "response.output_item.added",
-                            "output_index": item_idx,
-                            "item": {"type": "reasoning", "id": format!("item_{}", item_idx)}
-                        }))?;
-                        reasoning_started = true;
-                    }
-                    send(&mut conn, "response.reasoning_summary_text.delta", &json!({
-                        "type": "response.reasoning_summary_text.delta",
-                        "item_id": format!("item_{}", item_idx),
-                        "output_index": item_idx,
-                        "delta": r
-                    }))?;
-                }
-
-                // Parse tool calls from content
-                let (safe, calls) = tool_parser.push(&c, false);
-
-                // Emit text deltas
-                if !safe.is_empty() {
-                    if !message_started {
-                        if reasoning_started {
-                            // Close reasoning item first
-                            send(&mut conn, "response.output_item.done", &json!({
-                                "type": "response.output_item.done",
-                                "output_index": item_idx,
-                                "item": {"type": "reasoning", "id": format!("item_{}", item_idx)}
-                            }))?;
-                            item_idx += 1;
-                        }
-                        // Start message item
-                        send(&mut conn, "response.output_item.added", &json!({
-                            "type": "response.output_item.added",
-                            "output_index": item_idx,
-                            "item": {"type": "message", "id": format!("item_{}", item_idx), "role": "assistant"}
-                        }))?;
-                        send(&mut conn, "response.content_part.added", &json!({
-                            "type": "response.content_part.added",
-                            "item_id": format!("item_{}", item_idx),
-                            "output_index": item_idx,
-                            "content_index": 0,
-                            "part": {"type": "output_text", "text": ""}
-                        }))?;
-                        message_started = true;
-                    }
-                    send(&mut conn, "response.output_text.delta", &json!({
-                        "type": "response.output_text.delta",
-                        "item_id": format!("item_{}", item_idx),
-                        "output_index": item_idx,
-                        "content_index": 0,
-                        "delta": safe
-                    }))?;
-                }
-
-                all_calls.extend(calls);
-            }
-            Event::Done(d) => {
-                // Flush
-                let (r, c) = split.push("", true);
-                if !r.is_empty() && thinking_enabled && !reasoning_started {
-                    send(&mut conn, "response.output_item.added", &json!({
-                        "type": "response.output_item.added",
-                        "output_index": item_idx,
-                        "item": {"type": "reasoning", "id": format!("item_{}", item_idx)}
-                    }))?;
-                    reasoning_started = true;
-                }
-                if !r.is_empty() && reasoning_started {
-                    send(&mut conn, "response.reasoning_summary_text.delta", &json!({
-                        "type": "response.reasoning_summary_text.delta",
-                        "item_id": format!("item_{}", item_idx),
-                        "output_index": item_idx,
-                        "delta": r
-                    }))?;
-                }
-
-                let (safe, calls) = tool_parser.push(&c, true);
-                all_calls.extend(calls);
-
-                if !safe.is_empty() {
-                    if !message_started {
-                        if reasoning_started {
-                            send(&mut conn, "response.output_item.done", &json!({
-                                "type": "response.output_item.done",
-                                "output_index": item_idx,
-                                "item": {"type": "reasoning", "id": format!("item_{}", item_idx)}
-                            }))?;
-                            item_idx += 1;
-                        }
-                        send(&mut conn, "response.output_item.added", &json!({
-                            "type": "response.output_item.added",
-                            "output_index": item_idx,
-                            "item": {"type": "message", "id": format!("item_{}", item_idx), "role": "assistant"}
-                        }))?;
-                        send(&mut conn, "response.content_part.added", &json!({
-                            "type": "response.content_part.added",
-                            "item_id": format!("item_{}", item_idx),
-                            "output_index": item_idx,
-                            "content_index": 0,
-                            "part": {"type": "output_text", "text": ""}
-                        }))?;
-                        message_started = true;
-                    }
-                    send(&mut conn, "response.output_text.delta", &json!({
-                        "type": "response.output_text.delta",
-                        "item_id": format!("item_{}", item_idx),
-                        "output_index": item_idx,
-                        "content_index": 0,
-                        "delta": safe
-                    }))?;
-                }
-
-                // Close message item if started
-                if message_started {
-                    send(&mut conn, "response.output_text.done", &json!({
-                        "type": "response.output_text.done",
-                        "item_id": format!("item_{}", item_idx),
-                        "output_index": item_idx,
-                        "content_index": 0
-                    }))?;
-                    send(&mut conn, "response.content_part.done", &json!({
-                        "type": "response.content_part.done",
-                        "item_id": format!("item_{}", item_idx),
-                        "output_index": item_idx,
-                        "content_index": 0
-                    }))?;
-                    send(&mut conn, "response.output_item.done", &json!({
-                        "type": "response.output_item.done",
-                        "output_index": item_idx,
-                        "item": {"type": "message", "id": format!("item_{}", item_idx)}
-                    }))?;
-                    item_idx += 1;
-                } else if reasoning_started {
-                    send(&mut conn, "response.output_item.done", &json!({
-                        "type": "response.output_item.done",
-                        "output_index": item_idx,
-                        "item": {"type": "reasoning", "id": format!("item_{}", item_idx)}
-                    }))?;
-                    item_idx += 1;
-                }
-
-                // Emit function call items
-                for call in &all_calls {
-                    send(&mut conn, "response.output_item.added", &json!({
-                        "type": "response.output_item.added",
-                        "output_index": item_idx,
-                        "item": {
-                            "type": "function_call",
-                            "id": format!("item_{}", item_idx),
-                            "call_id": call.id,
-                            "name": call.name,
-                            "arguments": ""
-                        }
-                    }))?;
-                    send(&mut conn, "response.function_call_arguments.delta", &json!({
-                        "type": "response.function_call_arguments.delta",
-                        "item_id": format!("item_{}", item_idx),
-                        "output_index": item_idx,
-                        "delta": call.arguments.to_string()
-                    }))?;
-                    send(&mut conn, "response.function_call_arguments.done", &json!({
-                        "type": "response.function_call_arguments.done",
-                        "item_id": format!("item_{}", item_idx),
-                        "output_index": item_idx,
-                        "arguments": call.arguments.to_string()
-                    }))?;
-                    send(&mut conn, "response.output_item.done", &json!({
-                        "type": "response.output_item.done",
-                        "output_index": item_idx,
-                        "item": {
-                            "type": "function_call",
-                            "id": format!("item_{}", item_idx),
-                            "call_id": call.id,
-                            "name": call.name,
-                            "arguments": call.arguments.to_string()
-                        }
-                    }))?;
-                    item_idx += 1;
-                }
-
-                let status = if !all_calls.is_empty() { "incomplete" } else { "completed" };
-
-                // response.completed
-                send(&mut conn, "response.completed", &json!({
-                    "type": "response.completed",
-                    "response": {
-                        "id": id,
-                        "object": "response",
-                        "status": status,
-                        "model": model,
-                        "usage": usage(&d)
-                    }
-                }))?;
-            }
-        }
-    }
-
+    send(&mut conn, "response.completed", json!({"response": response_object(&id, model, "completed", output, usage(&d))}))?;
     Ok(())
 }
+

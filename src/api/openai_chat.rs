@@ -20,18 +20,23 @@ use super::toolcall::{ToolCallParser, tool_calls_to_openai};
 pub struct ThinkSplit {
     thinking: bool,
     buf: String,
+    /// Set once the closing tag has passed and until the answer's first visible character:
+    /// the blank lines the model puts after </think> belong to neither part.
+    skip_blank: bool,
 }
 
 impl ThinkSplit {
     const CLOSE: &'static str = "</think>";
 
     pub fn new(thinking: bool) -> Self {
-        Self { thinking, buf: String::new() }
+        Self { thinking, buf: String::new(), skip_blank: false }
     }
 
     /// Returns (reasoning, content) deltas that are safe to send now.
     pub fn push(&mut self, text: &str, last: bool) -> (String, String) {
         if !self.thinking {
+            let text = if self.skip_blank { text.trim_start() } else { text };
+            self.skip_blank &= text.is_empty();
             return (String::new(), text.to_string());
         }
         self.buf.push_str(text);
@@ -39,6 +44,7 @@ impl ThinkSplit {
             self.thinking = false;
             let reasoning = self.buf[..pos].trim_end().to_string();
             let content = self.buf[pos + Self::CLOSE.len()..].trim_start().to_string();
+            self.skip_blank = content.is_empty();
             self.buf.clear();
             return (reasoning, content);
         }
@@ -149,6 +155,7 @@ pub fn handle_sync(
     let mut tool_parser = ToolCallParser::new();
 
     let (mut reasoning, mut content) = (String::new(), String::new());
+    let mut calls = Vec::new();
     let mut done_info = None;
 
     for ev in rx {
@@ -156,9 +163,9 @@ pub fn handle_sync(
             Event::Text(t) => {
                 let (r, c) = split.push(&t, false);
                 reasoning.push_str(&r);
-                // Parse tool calls from content stream
-                let (safe_text, _calls) = tool_parser.push(&c, false);
+                let (safe_text, found) = tool_parser.push(&c, false);
                 content.push_str(&safe_text);
+                calls.extend(found);
             }
             Event::Done(d) => done_info = Some(d),
         }
@@ -167,8 +174,9 @@ pub fn handle_sync(
     // Flush
     let (r, c) = split.push("", true);
     reasoning.push_str(&r);
-    let (safe_text, calls) = tool_parser.push(&c, true);
+    let (safe_text, found) = tool_parser.push(&c, true);
     content.push_str(&safe_text);
+    calls.extend(found);
 
     let Some(d) = done_info else {
         return openai_error("engine stopped", "server_error", None);
@@ -314,6 +322,14 @@ pub fn handle_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn think_split_drops_blank_lines_after_close() {
+        let mut s = ThinkSplit::new(true);
+        assert_eq!(s.push("why</think>", false), ("why".to_string(), String::new()));
+        assert_eq!(s.push("\n\n", false), (String::new(), String::new()));
+        assert_eq!(s.push("51\n\nmore", false), (String::new(), "51\n\nmore".to_string()));
+    }
 
     #[test]
     fn think_split_basic() {

@@ -37,13 +37,11 @@ pub fn parse_request(
         _ => tools,
     };
 
-    // Map thinking config to enable_thinking kwarg
+    // The Messages API thinks only when asked: {"type": "enabled", ...} turns it on, and a
+    // request without a `thinking` field gets none, whatever the server's own default is.
     let mut kwargs = default_kwargs.clone();
-    if let Some(thinking) = req.get("thinking") {
-        if let Some(enabled) = thinking.get("enabled").and_then(Value::as_bool) {
-            kwargs.insert("enable_thinking".into(), Value::Bool(enabled));
-        }
-    }
+    let wants_thinking = req.pointer("/thinking/type").and_then(Value::as_str) == Some("enabled");
+    kwargs.insert("enable_thinking".into(), Value::Bool(wants_thinking));
 
     let prompt_text = template.render(&messages, tools.as_ref(), &kwargs)?;
     let thinking_enabled = kwargs.get("enable_thinking").and_then(Value::as_bool).unwrap_or(true);
@@ -286,6 +284,7 @@ pub fn handle_sync(
     let mut tool_parser = ToolCallParser::new();
 
     let (mut reasoning, mut content) = (String::new(), String::new());
+    let mut calls: Vec<ToolCall> = Vec::new();
     let mut done_info = None;
 
     for ev in rx {
@@ -293,8 +292,9 @@ pub fn handle_sync(
             Event::Text(t) => {
                 let (r, c) = split.push(&t, false);
                 reasoning.push_str(&r);
-                let (safe, _) = tool_parser.push(&c, false);
+                let (safe, found) = tool_parser.push(&c, false);
                 content.push_str(&safe);
+                calls.extend(found);
             }
             Event::Done(d) => done_info = Some(d),
         }
@@ -302,8 +302,9 @@ pub fn handle_sync(
 
     let (r, c) = split.push("", true);
     reasoning.push_str(&r);
-    let (safe, calls) = tool_parser.push(&c, true);
+    let (safe, found) = tool_parser.push(&c, true);
     content.push_str(&safe);
+    calls.extend(found);
 
     let Some(d) = done_info else {
         return anthropic_error("api_error", "engine stopped");
@@ -315,7 +316,8 @@ pub fn handle_sync(
     if !reasoning.is_empty() && thinking_enabled {
         blocks.push(json!({
             "type": "thinking",
-            "thinking": reasoning
+            "thinking": reasoning,
+            "signature": ""
         }));
     }
 
@@ -394,7 +396,7 @@ pub fn handle_stream(
                         send(&mut conn, "content_block_start", &json!({
                             "type": "content_block_start",
                             "index": block_idx,
-                            "content_block": {"type": "thinking", "thinking": ""}
+                            "content_block": {"type": "thinking", "thinking": "", "signature": ""}
                         }))?;
                         thinking_started = true;
                     }
@@ -441,7 +443,7 @@ pub fn handle_stream(
                     send(&mut conn, "content_block_start", &json!({
                         "type": "content_block_start",
                         "index": block_idx,
-                        "content_block": {"type": "thinking", "thinking": ""}
+                        "content_block": {"type": "thinking", "thinking": "", "signature": ""}
                     }))?;
                     thinking_started = true;
                 }
