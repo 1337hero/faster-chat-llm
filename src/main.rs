@@ -32,7 +32,7 @@ usage: faster-chat-llm <command> <gguf> [args]
               --chunk 2048      prefill rows per step
               --no-think        default enable_thinking to false
   gen       greedy generation from a raw prompt
-              --prompt TEXT | --ids 1,2,3    -n N    --tp N    --ctx N    --chunk N
+              --prompt TEXT | --ids 1,2,3 | --ids-file F    -n N    --tp N    --ctx N    --chunk N
               --draft N  --draft-vocab K     --profile    --dump (per-layer hidden state)
   score     teacher-force token ids and print top-k next-token log-probabilities
               --ids-file F  --prefix N  [--topk 20] [--tp N] [--ctx N]
@@ -41,7 +41,7 @@ usage: faster-chat-llm <command> <gguf> [args]
   meta      [prefix]   dump metadata keys
   tensor    <name>     one tensor's info and dequantised head
   dump      machine-readable tensor table (name, type, dims, offset)
-  encode    <text>     token ids for a string
+  encode    <text|->   token ids for a string (- reads stdin)
   tokcheck  <jsonl>    diff token ids against a reference, one JSON object per line
 "
     );
@@ -68,7 +68,11 @@ fn main() -> ExitCode {
         "inspect" => inspect(&gguf),
         "meta" => dump_meta(&gguf, args.get(3).map(|s| s.as_str())),
         "dump" => dump_tsv(&gguf),
-        "encode" => encode_cmd(&gguf, args.get(3).map(|s| s.as_str()).unwrap_or("")),
+        "encode" => match args.get(3).map(|s| s.as_str()) {
+            // "-" reads the text from stdin (arguments are capped at 128 KiB)
+            Some("-") => encode_cmd(&gguf, &std::io::read_to_string(std::io::stdin()).unwrap_or_default()),
+            other => encode_cmd(&gguf, other.unwrap_or("")),
+        },
         "tokcheck" => match args.get(3) {
             Some(path) => tokcheck(&gguf, path),
             None => usage(),
@@ -379,12 +383,13 @@ fn generate(g: &Gguf, args: &[String]) -> ExitCode {
         }
     };
     let tok = tokenizer::Tokenizer::from_gguf(g).expect("tokenizer");
-    let ids: Vec<u32> = match (opt(args, "--ids"), opt(args, "--prompt")) {
-        (Some(s), _) => s.split(',').filter_map(|v| v.trim().parse().ok()).collect(),
+    let ids_file = opt(args, "--ids-file").map(|p| std::fs::read_to_string(p).expect("read ids file"));
+    let ids: Vec<u32> = match (ids_file.as_deref().or(opt(args, "--ids")), opt(args, "--prompt")) {
+        (Some(s), _) => s.split(|c: char| !c.is_ascii_digit()).filter_map(|v| v.parse().ok()).collect(),
         (_, Some(p)) => tok.encode(p, true),
         _ => return usage(),
     };
-    eprintln!("prompt tokens: {ids:?}");
+    eprintln!("prompt tokens: {}", if ids.len() <= 64 { format!("{ids:?}") } else { format!("{} ids", ids.len()) });
 
     let mut eng = match build_engine(g, &hp, tp, ctx, 1, num("--draft-vocab", 102400), chunk) {
         Ok(e) => e,

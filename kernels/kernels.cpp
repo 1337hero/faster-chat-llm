@@ -316,13 +316,14 @@ __global__ void k_gdn_conv(const float * __restrict__ yin, int NIN,
 // per thread does not fit the register file). The pair sits in adjacent lanes and combines
 // with one shuffle. k and q of the current token are staged in shared memory.
 // state[slot][Hv][col][i] f32.
+#define PK_GDN_ROUND 8
 __global__ void k_gdn_step(float * __restrict__ state, const float * __restrict__ qkv, int R,
                            const float * __restrict__ yin, int NIN,
                            const float * __restrict__ norm_w, int Hk, int Hv, float eps,
                            int8_t * __restrict__ xq, float * __restrict__ xd, int xs,
                            const float * __restrict__ qkv_s, PkGroups G) {
-    __shared__ float red[4];
-    __shared__ float sk[128], sq[128], so[128];
+    __shared__ float red[PK_GDN_ROUND][4];
+    __shared__ float sk[PK_GDN_ROUND][128], sq[PK_GDN_ROUND][128], so[PK_GDN_ROUND][128];
     const int lv = blockIdx.x, g = blockIdx.y, tid = threadIdx.x;
     const int col = tid >> 1, half = tid & 1;
     const int lk = lv % Hk;
@@ -332,8 +333,6 @@ __global__ void k_gdn_step(float * __restrict__ state, const float * __restrict_
     const float * rows_cur  = qkv_s ? qkv_s + (int64_t) G.start[g] * qkv_row
                                     : qkv + ((int64_t) G.slot[g] * 2 + G.cur[g]) * R * qkv_row;
     float * st = state + (((int64_t) G.slot[g] * Hv + lv) * 128 + col) * 128 + half * 64;
-    const float * skh = sk + half * 64;
-    const float * sqh = sq + half * 64;
     const float scale = 1.0f / sqrtf(128.0f);
     const int n_rep = G.nacc[g], n_new = G.len[g];
     const bool commit = G.commit[g] != 0;
@@ -342,57 +341,77 @@ __global__ void k_gdn_step(float * __restrict__ state, const float * __restrict_
 #pragma unroll
     for (int i = 0; i < 64; i++) S[i] = st[i];
 
-    for (int step = 0; step < n_rep + n_new; step++) {
-        const bool is_new = step >= n_rep;
-        const float * row = is_new ? rows_cur + (int64_t) (step - n_rep) * qkv_row : rows_prev + (int64_t) step * qkv_row;
+    // Tokens go through in rounds of PK_GDN_ROUND so the workgroup meets at a barrier a few
+    // times per round instead of a few times per token: stage k and q for the round, run the
+    // recurrence, then normalise and quantise the round's outputs.
+    const int n_steps = n_rep + n_new;
+    for (int s0 = 0; s0 < n_steps; s0 += PK_GDN_ROUND) {
+        const int n_round = min(PK_GDN_ROUND, n_steps - s0);
         if (tid < 128) {
-            sq[tid] = row[lk * 128 + tid];
-            sk[tid] = row[(Hk + lk) * 128 + tid];
-        }
-        const float v = row[(2 * Hk + lv) * 128 + col];
-        const float gval = expf(row[CH + lv]);
-        const float beta = row[CH + Hv + lv];
-        __syncthreads();
-
-        // kv = S . k over the column: four interleaved partial sums per thread, then the pair
-        float k4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-#pragma unroll
-        for (int i = 0; i < 64; i++) k4[i & 3] += S[i] * skh[i];
-        float kv = (k4[0] + k4[1]) + (k4[2] + k4[3]);
-        kv += __shfl_xor(kv, 1, 32);
-        const float delta = (v - gval * kv) * beta;
-        float a4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-#pragma unroll
-        for (int i = 0; i < 64; i++) {
-            S[i] = gval * S[i] + skh[i] * delta;
-            a4[i & 3] += S[i] * sqh[i];
-        }
-        if (!commit && step == n_rep - 1) {
-#pragma unroll
-            for (int i = 0; i < 64; i++) st[i] = S[i];
-        }
-        if (is_new) {
-            float attn = (a4[0] + a4[1]) + (a4[2] + a4[3]);
-            attn += __shfl_xor(attn, 1, 32);
-            if (half == 0) so[col] = attn * scale;
-            __syncthreads();
-            // output: threads 0..127 take one column each, so a wave is one 32-element block
-            const int b = G.start[g] + (step - n_rep);
-            float o = 0.0f;
-            if (tid < 128) {
-                o = so[tid];
-                const float w = wave_sum(o * o);
-                if ((tid & 31) == 0) red[tid >> 5] = w;
+            for (int j = 0; j < n_round; j++) {
+                const int step = s0 + j;
+                const float * row = step >= n_rep ? rows_cur + (int64_t) (step - n_rep) * qkv_row : rows_prev + (int64_t) step * qkv_row;
+                sq[j][tid] = row[lk * 128 + tid];
+                sk[j][tid] = row[(Hk + lk) * 128 + tid];
             }
-            __syncthreads();
-            if (tid < 128) {
-                const float ss = (red[0] + red[1]) + (red[2] + red[3]);
+        }
+        __syncthreads();
+        for (int j = 0; j < n_round; j++) {
+            const int step = s0 + j;
+            const bool is_new = step >= n_rep;
+            const float * row = is_new ? rows_cur + (int64_t) (step - n_rep) * qkv_row : rows_prev + (int64_t) step * qkv_row;
+            const float v = row[(2 * Hk + lv) * 128 + col];
+            const float gval = expf(row[CH + lv]);
+            const float beta = row[CH + Hv + lv];
+            const float * skh = sk[j] + half * 64;
+            const float * sqh = sq[j] + half * 64;
+
+            // kv = S . k over the column: four interleaved partial sums per thread, then the pair
+            float k4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+            for (int i = 0; i < 64; i++) k4[i & 3] += S[i] * skh[i];
+            float kv = (k4[0] + k4[1]) + (k4[2] + k4[3]);
+            kv += __shfl_xor(kv, 1, 32);
+            const float delta = (v - gval * kv) * beta;
+            float a4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+            for (int i = 0; i < 64; i++) {
+                S[i] = gval * S[i] + skh[i] * delta;
+                a4[i & 3] += S[i] * sqh[i];
+            }
+            if (!commit && step == n_rep - 1) {
+#pragma unroll
+                for (int i = 0; i < 64; i++) st[i] = S[i];
+            }
+            if (is_new) {
+                float attn = (a4[0] + a4[1]) + (a4[2] + a4[3]);
+                attn += __shfl_xor(attn, 1, 32);
+                if (half == 0) so[j][col] = attn * scale;
+            }
+        }
+        __syncthreads();
+        // outputs: threads 0..127 take one column each, so a wave is one 32-element block
+        if (tid < 128) {
+            for (int j = 0; j < n_round; j++) {
+                if (s0 + j < n_rep) continue;
+                const float o = so[j][tid];
+                const float w = wave_sum(o * o);
+                if ((tid & 31) == 0) red[j][tid >> 5] = w;
+            }
+        }
+        __syncthreads();
+        if (tid < 128) {
+            for (int j = 0; j < n_round; j++) {
+                const int step = s0 + j;
+                if (step < n_rep) continue;
+                const int b = G.start[g] + (step - n_rep);
+                const float ss = (red[j][0] + red[j][1]) + (red[j][2] + red[j][3]);
                 const float z = yin[(int64_t) b * NIN + CH + lv * 128 + tid];
-                const float y = o * (1.0f / sqrtf(ss / 128.0f + eps)) * norm_w[tid] * silu_f(z);
+                const float y = so[j][tid] * (1.0f / sqrtf(ss / 128.0f + eps)) * norm_w[tid] * silu_f(z);
                 quant_block(y, xq, xd, xs, b, lv * 128 + tid);
             }
         }
-        __syncthreads(); // everyone is done with the staged token before the next overwrites it
+        __syncthreads(); // the round's staging is free to be overwritten
     }
     if (commit) {
 #pragma unroll
