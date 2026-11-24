@@ -1,2 +1,7 @@
 target/
 *.gguf
+
+PROMPT.md
+PLAN.md
+MODEL_CARD.md
+THEORY.md
