@@ -752,15 +752,16 @@ void pk_gemm(hipStream_t s, const int8_t * W, const void * Wd, const int8_t * xq
              float * y, int64_t rows, int cols, int N, int y_stride) {
     const uint32_t tiles = (uint32_t) (rows / 16);
     // One pass over the weights costs the same whatever N is, so the kernel is sized to the
-    // batch: J activation tiles per weight load to cover the rows, and as many waves per
-    // weight tile as shared memory allows (few rows are latency-bound otherwise). Past 256
-    // rows the batch itself supplies the parallelism and one wave per tile is best.
+    // batch. Up to a tile or two of rows, many waves share each weight tile (few rows are
+    // latency-bound otherwise). Beyond that, one wave per (weight tile, group of J activation
+    // tiles) and no shared memory: the batch supplies the parallelism, and shared memory would
+    // cap how many waves a compute unit keeps in flight. Measured per step at TP2:
+    // 24 rows 56 ms (2x16) vs 75 (4x1); 100 rows 117 ms (4x1) vs 193 (8x4); 200 rows 192 vs 290.
 #define PK_GEMM_LAUNCH(J, NW) \
     hipLaunchKernelGGL((k_gemm<J, NW>), dim3((N + 16 * J - 1) / (16 * J), tiles), dim3(32 * NW), 0, s, W, (const _Float16 *) Wd, xq, xd, xs, b_off, y, cols, N, y_stride)
     if (N <= 16)       PK_GEMM_LAUNCH(1, PK_GEMM_WAVES);
     else if (N <= 32)  PK_GEMM_LAUNCH(2, 16);
-    else if (N <= 64)  PK_GEMM_LAUNCH(4, 8);
-    else if (N <= 256) PK_GEMM_LAUNCH(8, 4);
+    else if (N <= 512) PK_GEMM_LAUNCH(4, 1);
     else               PK_GEMM_LAUNCH(8, 1);
 #undef PK_GEMM_LAUNCH
 }

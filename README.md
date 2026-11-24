@@ -10,6 +10,12 @@ It reads standard GGUF files directly (metadata, tokenizer, chat template, quant
 (~280 tok/s c1 on an R9700 with speculative decoding), not the ~40-70 tok/s a generic GGUF engine
 manages. Everything below is in service of that number.
 
+That reference is a 4-bit model (MXFP4, with a merged LoRA). At Q8_0 the same cards read twice
+the bytes per step: 14.2 GB per card, 26.4 ms at the measured 537 GB/s, so 280 tok/s would take
+about 7.4 tokens out of every step. The model's own MTP head yields 2.2 to 5.6. With weights
+as stored, the number is out of reach by arithmetic, not by engineering; reaching it means a
+4-bit weight format or a much stronger drafter, both opt-in under goal 3.
+
 **2. RDNA4 and RDNA3 are first-class, not "portable".** Two arch families get their own kernel
 libraries, selected at load time:
 
@@ -80,14 +86,13 @@ build-to-build spread.
 
 Known gaps:
 
-- Slower than llama.cpp on prefill beyond ~100K tokens (6 to 14%) and on time to first token
-  for prompts of roughly 80 to 500 tokens (13 to 25%).
+- Slower than llama.cpp on prefill beyond ~100K tokens (6 to 14%), and on time to first token
+  for prompts around 500 tokens (about 10%; faster at 40 to 260 and at 940).
 - A stream's decode slows while the other slot prefills a long prompt (35 tok/s measured
   beside a 131K-token prefill).
 - One model, one quantisation (Q8_0 + F32), one GPU family. No vision. Sampling other than
   greedy runs on the host. `logprobs` are not implemented.
-- Nowhere near goal 1 yet: that needs a stronger drafter than the MTP head, which is opt-in
-  territory under goal 3.
+- Goal 1 is not reachable at Q8_0 (see the arithmetic under it).
 
 ## Build
 
