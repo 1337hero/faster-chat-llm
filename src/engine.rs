@@ -114,9 +114,11 @@ struct Xchg {
 const XCHG_FLAGS: usize = 32;
 
 /// Largest batch whose partials are traded by the on-card exchange kernel. Every step pays one
-/// full pass over the weights, so a 40-token prompt should be one step, not three; and below
-/// this size the kernel beats a bulk card-to-card copy, whose fixed latency is milliseconds.
-const XCHG_ROWS: usize = 512;
+/// full pass over the weights, so a 40-token prompt should be one step, not three. Above this
+/// size the exchange (PCIe-bound, ~2 µs per row) is worth hiding behind compute, and the batch
+/// runs as two interleaved halves instead. Measured: a 262-token prompt takes 201 ms split
+/// above 256 rows, 185 ms above 128, 219 ms above 64.
+const XCHG_ROWS: usize = 128;
 
 pub struct Prof {
     last: Instant,

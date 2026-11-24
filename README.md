@@ -74,9 +74,10 @@ run before and after):
 |---|---:|---:|
 | Decode, 1 stream (tok/s) | 67.5 | 75.1 to 76.6 |
 | Decode, 2 streams, aggregate (tok/s) | 126.3 | 152.5 |
-| Prefill at ~2.8K / ~21.5K prompt tokens (tok/s) | 1550 / 1668 | 1822 / 1717 |
+| Prefill at ~2.8K / ~21.5K prompt tokens (tok/s) | 1550 to 1610 / 1630 to 1670 | 1690 to 1990 / 1510 to 1735 |
 | Prefill at 131K / 259K prompt tokens (tok/s) | 1148 / 799 | 990 to 1075 / 730 |
 | Time to first token, 19-token prompt | 184 ms | 87 ms |
+| Time to first token, 42 / 262 / 942-token prompt | 176 / 294 / 669 ms | 123 / 242 / 545 ms |
 | Start to ready | ~22 s | ~8 s |
 
 Agreement with upstream llama.cpp on the same GGUF, teacher-forced over 2,991 positions: the
@@ -86,9 +87,11 @@ build-to-build spread.
 
 Known gaps:
 
-- Slower than llama.cpp on prefill beyond ~100K tokens (6 to 14%), and on time to first token
-  for prompts around 500 tokens (about 10%; faster at 40 to 260 and at 940).
-- A stream's decode slows while the other slot prefills a long prompt (35 tok/s measured
+- Slower than llama.cpp on prefill beyond ~100K tokens (6 to 14%).
+- Prefill throughput varies from one server launch to the next (the ranges above): large
+  batches time their card-to-card transfers from the host. At ~21.5K tokens that puts it
+  anywhere from 7% behind llama.cpp to 6% ahead.
+- A stream's decode slows while the other slot prefills a long prompt (61 tok/s measured
   beside a 131K-token prefill).
 - One model, one quantisation (Q8_0 + F32), one GPU family. No vision. Sampling other than
   greedy runs on the host. `logprobs` are not implemented.
