@@ -627,6 +627,118 @@ __global__ void k_attn_seg(const _Float16 * __restrict__ qr, int Hq, int Hkv,
     }
 }
 
+// Prefill form of k_attn_seg: grid (Hq, row tiles), block 64, one launch per cache stretch
+// `seg`, each (row tile, head) carrying one partial through the stretches in place.
+// The two waves of a workgroup split the work instead of repeating it: each computes half of
+// the Q.K chunks, they exchange partial score tiles through shared memory, and each then owns
+// half of the output-dim tiles. Shared memory is touched once per lane per tile pair, with two
+// alternating buffers so one barrier per tile pair is enough.
+__global__ void k_attn_sweep(const _Float16 * __restrict__ qr, int Hq, int Hkv,
+                             const _Float16 * __restrict__ Kc, const _Float16 * __restrict__ Vc, int seg_tiles,
+                             float * __restrict__ part, int seg, PkGroups G) {
+    __shared__ float cpart[2][2][32][8];
+    const int hq = blockIdx.x, ty = blockIdx.y;
+    const PkTile T = attn_tile(G, ty, seg_tiles);
+    if (seg < T.seg_lo || seg > T.seg_hi) return;
+    const int lane = threadIdx.x & 31, wv = threadIdx.x >> 5, lo = lane & 15, hi = lane >> 4;
+    const int g = T.g, hkv = hq / (Hq / Hkv);
+    const int dir = G.kv_dir[g];
+    const int64_t base = G.kv_base[g];
+    const int64_t p_first = (int64_t) G.pos0[g] + T.i0;
+    const int64_t p_row = lo < T.nr ? p_first + lo : -1;
+    const _Float16 * q = qr + (((int64_t) G.start[g] + T.i0 + lo) * Hq + hq) * 256 + hi * 8 + wv * 128;
+    const float kq_scale = 1.0f / sqrtf(256.0f);
+
+    float * out = part + ((int64_t) ty * Hq + hq) * PK_ATTN_PART;
+    float * out_ml = out + 16 * 256 + wv * 32;
+    const int d0 = wv * 128;
+    v8f O[8];
+    float m = PK_NEG_BIG, l = 0.0f;
+    if (seg > T.seg_lo) {
+        for (int t = 0; t < 8; t++)
+            for (int e = 0; e < 8; e++) O[t][e] = out[(hi * 8 + e) * 256 + d0 + t * 16 + lo];
+        m = out_ml[lo];
+        l = out_ml[16 + lo];
+    } else {
+        for (int t = 0; t < 8; t++) O[t] = (v8f) {0, 0, 0, 0, 0, 0, 0, 0};
+    }
+
+    const int st_first = max(T.st_lo, seg * seg_tiles);
+    const int st_last = (int) min((int64_t) T.st_hi, (int64_t) seg * seg_tiles + seg_tiles - 1);
+    for (int st = st_first; st <= st_last; st++) {
+        // this wave's half of the score tile: dims [wv*128, wv*128 + 128)
+        const _Float16 * k = Kc + (((int64_t) st * 16 + lo) * Hkv + hkv) * 256 + hi * 8 + wv * 128;
+        v8f c = {0, 0, 0, 0, 0, 0, 0, 0};
+#pragma unroll
+        for (int c4 = 0; c4 < 8; c4 += 4) {
+            v8h ka[4], qb[4];
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                memcpy(&ka[i], k + (c4 + i) * 16, 16);
+                memcpy(&qb[i], q + (c4 + i) * 16, 16);
+            }
+#pragma unroll
+            for (int i = 0; i < 4; i++) c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(ka[i], qb[i], c);
+        }
+        float (*buf)[32][8] = cpart[st & 1];
+        for (int e = 0; e < 8; e++) buf[wv][lane][e] = c[e];
+        __syncthreads();
+        // both waves form the same sum in the same order
+        for (int e = 0; e < 8; e++) c[e] = buf[0][lane][e] + buf[1][lane][e];
+
+        const int64_t tile_last_pos = dir > 0 ? (int64_t) st * 16 + 15 : base - (int64_t) st * 16;
+        const bool all_visible = tile_last_pos <= p_first;
+        float mx = PK_NEG_BIG;
+        bool ok[8];
+        for (int e = 0; e < 8; e++) {
+            if (all_visible) {
+                ok[e] = true;
+                c[e] = c[e] * kq_scale;
+            } else {
+                const int64_t slot = (int64_t) st * 16 + hi * 8 + e;
+                const int64_t pos = dir > 0 ? slot : base - slot;
+                ok[e] = pos >= 0 && pos <= p_row;
+                c[e] = ok[e] ? c[e] * kq_scale : PK_NEG_BIG;
+            }
+            mx = fmaxf(mx, c[e]);
+        }
+        mx = fmaxf(mx, __shfl_xor(mx, 16, 32));
+        const float m_new = fmaxf(m, mx);
+        const float alpha = expf(m - m_new);
+        v8f p;
+        float psum = 0.0f;
+        for (int e = 0; e < 8; e++) {
+            p[e] = ok[e] ? expf(c[e] - m_new) : 0.0f;
+            psum += p[e];
+        }
+        psum += __shfl_xor(psum, 16, 32);
+        l = l * alpha + psum;
+        m = m_new;
+        if (__ballot(alpha != 1.0f) != 0) {
+            v8f av;
+            for (int e = 0; e < 8; e++) av[e] = __shfl(alpha, hi * 8 + e, 32);
+#pragma unroll
+            for (int t = 0; t < 8; t++) O[t] *= av;
+        }
+        const v8h pa = __builtin_convertvector(p, v8h);
+        const _Float16 * v = Vc + ((((int64_t) st * Hkv + hkv) * 256 + d0 + lo) * 16) + hi * 8;
+#pragma unroll
+        for (int t4 = 0; t4 < 8; t4 += 4) {
+            v8h vb[4];
+#pragma unroll
+            for (int i = 0; i < 4; i++) memcpy(&vb[i], v + (t4 + i) * 16 * 16, 16);
+#pragma unroll
+            for (int i = 0; i < 4; i++) O[t4 + i] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(pa, vb[i], O[t4 + i]);
+        }
+    }
+    for (int t = 0; t < 8; t++)
+        for (int e = 0; e < 8; e++) out[(hi * 8 + e) * 256 + d0 + t * 16 + lo] = O[t][e];
+    if (hi == 0) {
+        out_ml[lo] = m;
+        out_ml[16 + lo] = l;
+    }
+}
+
 // grid (Hq, B), block 256 (thread = output dim). out = sum_seg O / sum_seg l, times
 // sigmoid(gate), quantised.
 __global__ void k_attn_merge(const float * __restrict__ part, int S, const float * __restrict__ yin, int NIN,
@@ -838,8 +950,8 @@ void pk_attn_swept(hipStream_t s, const void * qr, const float * yin, int NIN, i
                    const void * Vc, int seg_tiles, int seg_first, int seg_last, float * part, int tiles, int8_t * xq,
                    float * xd, int xs, int B, const PkGroups * G) {
     for (int seg = seg_first; seg <= seg_last; seg++) {
-        hipLaunchKernelGGL(k_attn_seg<2>, dim3(Hq * 2, tiles, 1), dim3(32), 0, s, (const _Float16 *) qr, Hq, Hkv, (const _Float16 *) Kc,
-                           (const _Float16 *) Vc, seg_tiles, part, 1, seg, *G);
+        hipLaunchKernelGGL(k_attn_sweep, dim3(Hq, tiles), dim3(64), 0, s, (const _Float16 *) qr, Hq, Hkv, (const _Float16 *) Kc,
+                           (const _Float16 *) Vc, seg_tiles, part, seg, *G);
     }
     // one partial per row tile: merge it as a single segment spanning everything
     hipLaunchKernelGGL(k_attn_merge, dim3(Hq, B), dim3(256), 0, s, part, 1, yin, NIN, Hq, 0x7fffffff, xq, xd, xs, *G);

@@ -72,26 +72,25 @@ run before and after):
 
 | | llama.cpp | faster-chat-llm |
 |---|---:|---:|
-| Decode, 1 stream (tok/s) | 67.5 | 75.1 to 76.6 |
-| Decode, 2 streams, aggregate (tok/s) | 126.3 | 152.5 |
-| Prefill at ~2.8K / ~21.5K prompt tokens (tok/s) | 1550 to 1610 / 1630 to 1670 | 1690 to 1990 / 1510 to 1735 |
-| Prefill at 131K / 259K prompt tokens (tok/s) | 1148 / 799 | 990 to 1075 / 730 |
-| Time to first token, 19-token prompt | 184 ms | 87 ms |
+| Decode, 1 stream (tok/s) | 67.8 | 77.1 to 79.1 |
+| Decode, 2 streams, aggregate (tok/s) | 127.0 | 157.4 to 164.8 |
+| Prefill at ~2.8K / ~21.5K prompt tokens (tok/s) | 1555 / 1675 | 1870 to 1997 / 1759 to 1781 |
+| Prefill at 131K / 259K prompt tokens (tok/s) | 1153 / 801 | 1357 / 1021 |
+| Time to first token, 19-token prompt | 185 ms | 87 ms |
 | Time to first token, 42 / 262 / 942-token prompt | 176 / 294 / 669 ms | 123 / 242 / 545 ms |
 | Start to ready | ~22 s | ~8 s |
 
 Agreement with upstream llama.cpp on the same GGUF, teacher-forced over 2,991 positions: the
 top token matches 99.67% of the time and top-20 KL averages 0.00021. Two llama.cpp backends
 compared the same way agree 99.50% with KL 0.00020, so the engine sits at llama.cpp's own
-build-to-build spread.
+build-to-build spread. Against the BF16 checkpoint, KL is 0.00031 (llama.cpp's Q8_0 path:
+0.00032). Sampled output (temperature 0.8) is byte-identical with and without drafts.
 
 Known gaps:
 
-- Slower than llama.cpp on prefill beyond ~100K tokens (6 to 14%).
-- Prefill throughput varies from one server launch to the next (the ranges above): large
-  batches time their card-to-card transfers from the host. At ~21.5K tokens that puts it
-  anywhere from 7% behind llama.cpp to 6% ahead.
-- A stream's decode slows while the other slot prefills a long prompt (61 tok/s measured
+- Prefill throughput moves with host load (large batches are timed partly from the host): the
+  same build has measured 10 to 15% apart an hour apart. Compare only same-hour runs.
+- A stream's decode slows while the other slot prefills a long prompt (35 to 61 tok/s measured
   beside a 131K-token prefill).
 - One model, one quantisation (Q8_0 + F32), one GPU family. No vision. Sampling other than
   greedy runs on the host. `logprobs` are not implemented.
