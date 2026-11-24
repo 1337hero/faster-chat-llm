@@ -67,25 +67,24 @@ What is built and verified:
   and Anthropic Python SDKs: chat, streaming, tool-call round trips, Responses, thinking.
 
 Measured on this hardware against llama.cpp serving the same GGUF on the same two cards
-(tensor split + MTP drafts; greedy, thinking off, medians of a fixed six-prompt panel, baseline
-run before and after):
+(tensor split + MTP drafts), both measured the same night:
 
-| | llama.cpp | faster-chat-llm |
-|---|---:|---:|
-| Decode, 1 stream (tok/s) | 67.8 | 77.1 to 79.3 |
-| Decode, 2 streams, aggregate (tok/s) | 127.0 | 157.4 to 164.8 |
-| Prefill at ~2.8K / ~21.5K prompt tokens (tok/s) | 1555 / 1675 | 1870 to 1997 / 1759 to 1781 |
-| Prefill at 131K / 259K prompt tokens (tok/s) | 1104 to 1153 / 801 | 1346 to 1391 / 1021 to 1029 |
-| Decode at 131K context, 400-token answers (tok/s) | 40.2 | 43.9 to 44.2 |
-| Time to first token, 19-token prompt | 185 ms | 87 ms |
-| Time to first token, 42 / 262 / 942-token prompt | 176 / 294 / 669 ms | 123 / 242 / 545 ms |
-| Start to ready, warm page cache | 12.5 to 14 s | 7 to 8 s |
+| Metric | llama.cpp | faster-chat-llm | Ceiling | How measured |
+|---|---:|---:|---:|---|
+| Decode, 1 stream | 67.8 tok/s | 79.3 | ~100 at the panel's median tokens per step (67 to 170 by prompt); 37.9 without speculation | median of a fixed six-prompt panel, greedy, thinking off, 7 MTP drafts; draft acceptance 0.17 to 0.61 by prompt |
+| Decode, 2 streams | 127.0 | 162.1 | ~200 (twice the 1-stream ceiling: a weight pass costs the same for 1 to 16 rows) | wall-clock aggregate |
+| Prefill at 4K / 32K / 128K | 1555 / 1675 / 1104 to 1153 | 1890 / 1768 / 1346 to 1391 | not stated (no independent peak for the int8 matrix core) | cold unique prompt, prompt tokens / time to first token; real sizes ~2.8K / ~21.5K / 131K |
+| Prefill at 259K | 801 | 1029 | | single run each |
+| Decode at 131K context | 40.2 | 43.9 to 44.2 | | 400-token answers |
+| KV capacity | 262,144 | 262,144 | 262,144 | needle retrieval 3/3 at 130,728 and 259,231 tokens; two concurrent 131K requests, both 3/3 |
+| Start to ready | 12.5 to 14 s | 7 to 8 s | ~5 s read floor | warm page cache |
+| Time to first token | 185 ms | 87 ms | | 19-token prompt; 42 / 262 / 942 tokens: 123 / 242 / 545 ms vs 176 / 294 / 669 |
+| Peak memory | 54.2 GiB | 50.4 GiB | 68 GiB cap | VRAM on both cards + host anonymous memory; 25.8 GiB per card at full context |
+| Quality | 99.50%, KL 0.000204 between two of its own backends | 99.67%, KL 0.000211 | | top-token agreement and top-20 KL vs upstream llama.cpp, teacher-forced over 2,991 positions |
 
-Agreement with upstream llama.cpp on the same GGUF, teacher-forced over 2,991 positions: the
-top token matches 99.67% of the time and top-20 KL averages 0.00021. Two llama.cpp backends
-compared the same way agree 99.50% with KL 0.00020, so the engine sits at llama.cpp's own
-build-to-build spread. Against the BF16 checkpoint, KL is 0.00031 (llama.cpp's Q8_0 path:
-0.00032). Sampled output (temperature 0.8) is byte-identical with and without drafts.
+Against the BF16 checkpoint, KL is 0.00031 (llama.cpp's Q8_0 path: 0.00032). Speculative
+decode is token-identical to plain decode under greedy, and byte-identical under sampling
+(temperature 0.8, two seeds).
 
 Known gaps:
 
