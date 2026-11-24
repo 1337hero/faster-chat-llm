@@ -127,13 +127,21 @@ pub struct Prof {
 
 impl Prof {
     pub fn new() -> Self {
-        Self { last: Instant::now(), buckets: BTreeMap::new() }
+        Self {
+            last: Instant::now(),
+            buckets: BTreeMap::new(),
+        }
     }
 
     pub fn report(&self) {
         let total: f64 = self.buckets.values().map(|v| v.0).sum();
         for (k, (t, n)) in &self.buckets {
-            eprintln!("  {k:<12} {:8.2} ms total  {:5.1}%  {n:6} launches  {:7.1} us each", t * 1e3, 100.0 * t / total, t * 1e6 / *n as f64);
+            eprintln!(
+                "  {k:<12} {:8.2} ms total  {:5.1}%  {n:6} launches  {:7.1} us each",
+                t * 1e3,
+                100.0 * t / total,
+                t * 1e6 / *n as f64
+            );
         }
         eprintln!("  {:<12} {:8.2} ms", "total", total * 1e3);
     }
@@ -141,15 +149,36 @@ impl Prof {
 
 const R: usize = BMAX;
 
+pub struct Capacity {
+    pub slots: usize,
+    pub kv: usize,
+    pub rows: usize,
+}
+
 impl Rank {
     /// `rows` is the largest batch a step may carry (the prefill chunk).
-    pub fn new(dev: usize, s: Stream, hp: &HParams, sh: Shard, w: Weights, n_slots: usize, cap: usize, rows: usize) -> Self {
+    pub fn new(
+        dev: usize,
+        s: Stream,
+        hp: &HParams,
+        sh: Shard,
+        w: Weights,
+        capacity: Capacity,
+    ) -> Self {
+        let Capacity {
+            slots: n_slots,
+            kv: cap,
+            rows,
+        } = capacity;
         let dm = sh.dims(hp);
         let xmax = (2 * dm.d).max(dm.ff).max(dm.gv * hp.gs).max(dm.hq * hp.hd);
         let ymax = (2 * dm.ff).max(dm.gdn_nin).max(dm.attn_nin);
         // Zeroed: attention reads whole 16-slot tiles and masks the slots a row may not see, so
         // unwritten slots must hold finite values.
-        let new_kv = || KvBufs { k: DevBuf::zeroed(cap * dm.hkv * hp.hd, s), v: DevBuf::zeroed(cap * dm.hkv * hp.hd, s) };
+        let new_kv = || KvBufs {
+            k: DevBuf::zeroed(cap * dm.hkv * hp.hd, s),
+            v: DevBuf::zeroed(cap * dm.hkv * hp.hd, s),
+        };
         let (mut gdn, mut kv) = (Vec::new(), Vec::new());
         for l in 0..hp.n_layer {
             if hp.is_attn(l) {
@@ -190,11 +219,16 @@ impl Rank {
             logits: DevBuf::new(BMAX * dm.vocab),
             best: DevBuf::new(BMAX * 2),
             best_peer: DevBuf::new(BMAX * 2),
-            drafted: DevBuf::new(BMAX * BMAX),
+            // Downloads include unused row padding between steps.
+            drafted: DevBuf::zeroed(BMAX * BMAX, s),
             err: DevBuf::zeroed(1, s),
             qr: DevBuf::zeroed(padded * dm.hq * hp.hd, s),
             // Decode: a few row tiles, each cut into segments; prefill: many row tiles, one segment each.
-            part: DevBuf::new((n_slots * cap.div_ceil(hip::ATTN_SEG_SLOTS)).max(attn_tiles(rows)) * dm.hq * hip::ATTN_PART),
+            part: DevBuf::new(
+                (n_slots * cap.div_ceil(hip::ATTN_SEG_SLOTS)).max(attn_tiles(rows))
+                    * dm.hq
+                    * hip::ATTN_PART,
+            ),
             mix_s: DevBuf::new((3 * hip::MAX_GROUPS + rows) * dm.ch),
             qkv_s: f(dm.ch + 2 * dm.gv),
             gdn,
@@ -216,7 +250,11 @@ impl Rank {
 /// Row stride of the block-major activation layout for a batch of `b` rows: one tile of 16
 /// for decode-sized batches, whole 128-row tiles above that.
 fn xs(b: usize) -> i32 {
-    (if b <= BMAX { BMAX } else { b.next_multiple_of(128) }) as i32
+    (if b <= BMAX {
+        BMAX
+    } else {
+        b.next_multiple_of(128)
+    }) as i32
 }
 
 /// Row tiles the attention scratch must hold for a batch of up to `rows` rows.
@@ -260,11 +298,35 @@ struct Batch {
 
 impl Engine {
     pub fn new(hp: HParams, ranks: Vec<Rank>, n_slots: usize, cap: usize, rows: usize) -> Self {
-        assert!(n_slots <= 2, "the KV pool is laid out for at most two sequences");
-        let seqs = vec![Seq { last_committed: true, ..Default::default() }; n_slots];
-        assert!(ranks.len() <= 2, "the exchange is pairwise: one or two ranks");
-        let xchg = (ranks.len() == 2).then(|| Xchg { mem: hip::Pinned::shared(4 * XCHG_ROWS * hp.d * 4 + 2 * XCHG_FLAGS * 8), seq: std::cell::Cell::new(0) });
-        Self { hp, ranks, seqs, cap, rows, dump: false, prof: None, xchg }
+        assert!(
+            n_slots <= 2,
+            "the KV pool is laid out for at most two sequences"
+        );
+        let seqs = vec![
+            Seq {
+                last_committed: true,
+                ..Default::default()
+            };
+            n_slots
+        ];
+        assert!(
+            ranks.len() <= 2,
+            "the exchange is pairwise: one or two ranks"
+        );
+        let xchg = (ranks.len() == 2).then(|| Xchg {
+            mem: hip::Pinned::shared(4 * XCHG_ROWS * hp.d * 4 + 2 * XCHG_FLAGS * 8),
+            seq: std::cell::Cell::new(0),
+        });
+        Self {
+            hp,
+            ranks,
+            seqs,
+            cap,
+            rows,
+            dump: false,
+            prof: None,
+            xchg,
+        }
     }
 
     /// Forget a sequence: zero its recurrent state and conv history.
@@ -287,7 +349,10 @@ impl Engine {
             hip::set_device(r.dev);
             unsafe { hip::zero_range(r.hprev.ptr().add(slot * d) as *mut c_void, d * 4, r.s) };
         }
-        self.seqs[slot] = Seq { last_committed: true, ..Default::default() };
+        self.seqs[slot] = Seq {
+            last_committed: true,
+            ..Default::default()
+        };
     }
 
     /// Accept the first `n` rows of the slot's last (pending) step.
@@ -333,17 +398,59 @@ impl Engine {
             Pend::A => (at(&r.pa), if two { at(&r.peer_a) } else { null }),
             Pend::B => (at(&r.pb), if two { at(&r.peer_b) } else { null }),
         };
-        let xf = if xf { at(&r.xf) as *mut f32 } else { std::ptr::null_mut() };
+        let xf = if xf {
+            at(&r.xf) as *mut f32
+        } else {
+            std::ptr::null_mut()
+        };
         let (xq, xd) = r.act(bt);
-        unsafe { hip::pk_norm_quant(r.s, at(&r.h) as *mut f32, p0, p1, w.ptr(), self.hp.eps, self.hp.d as i32, bt.b as i32, xq, xd, bt.xs, 0, xf) };
+        unsafe {
+            hip::pk_norm_quant(
+                r.s,
+                at(&r.h) as *mut f32,
+                p0,
+                p1,
+                w.ptr(),
+                self.hp.eps,
+                self.hp.d as i32,
+                bt.b as i32,
+                xq,
+                xd,
+                bt.xs,
+                0,
+                xf,
+            )
+        };
         self.t(r, "norm");
     }
 
     /// y[row][m.rows] = m x activations, for the batch's rows. `y` is the batch's first row.
     fn gemv(&self, r: &Rank, m: &Mat, y: *mut f32, bt: &Batch) {
         let (xq, xd) = r.act(bt);
-        unsafe { hip::pk_gemm(r.s, m.qs.ptr(), m.d.ptr(), xq, xd, bt.xs, 0, y, m.rows as i64, m.cols as i32, bt.b as i32, m.rows as i32) }
-        self.t(r, match m.rows { 0..=6000 => "gemv-out", 6001..=40000 => "gemv-in", _ => "gemv-head" });
+        unsafe {
+            hip::pk_gemm(
+                r.s,
+                m.qs.ptr(),
+                m.d.ptr(),
+                xq,
+                xd,
+                bt.xs,
+                0,
+                y,
+                m.rows as i64,
+                m.cols as i32,
+                bt.b as i32,
+                m.rows as i32,
+            )
+        }
+        self.t(
+            r,
+            match m.rows {
+                0..=6000 => "gemv-out",
+                6001..=40000 => "gemv-in",
+                _ => "gemv-head",
+            },
+        );
     }
 
     /// Trade a sublayer's partial outputs between the two ranks.
@@ -369,10 +476,25 @@ impl Engine {
         let flags = unsafe { data.add(4 * area) } as *mut i64;
         for (i, r) in self.ranks.iter().enumerate() {
             hip::set_device(r.dev);
-            let (own, peer) = if a { (&r.pa, &r.peer_a) } else { (&r.pb, &r.peer_b) };
+            let (own, peer) = if a {
+                (&r.pa, &r.peer_a)
+            } else {
+                (&r.pb, &r.peer_b)
+            };
             let half = (seq & 1) as usize;
             unsafe {
-                hip::pk_xchg(r.s, own.ptr(), data.add((i * 2 + half) * area), flags.add(i * XCHG_FLAGS), data.add(((1 - i) * 2 + half) * area), flags.add((1 - i) * XCHG_FLAGS), peer.ptr(), n as i32, seq, r.err.ptr());
+                hip::pk_xchg(
+                    r.s,
+                    own.ptr(),
+                    data.add((i * 2 + half) * area),
+                    flags.add(i * XCHG_FLAGS),
+                    data.add(((1 - i) * 2 + half) * area),
+                    flags.add((1 - i) * XCHG_FLAGS),
+                    peer.ptr(),
+                    n as i32,
+                    seq,
+                    r.err.ptr(),
+                );
             }
         }
         if self.prof.is_some() {
@@ -388,8 +510,21 @@ impl Engine {
         for (i, r) in self.ranks.iter().enumerate() {
             let peer = &self.ranks[1 - i];
             hip::set_device(r.dev);
-            let (src, dst) = if a { (&r.pa, &peer.peer_a) } else { (&r.pb, &peer.peer_b) };
-            unsafe { hip::copy_peer(dst.ptr().add(o), peer.dev, src.ptr().add(o) as *const f32, r.dev, bt.b * self.hp.d, if side_stream { r.sx } else { r.s }) };
+            let (src, dst) = if a {
+                (&r.pa, &peer.peer_a)
+            } else {
+                (&r.pb, &peer.peer_b)
+            };
+            unsafe {
+                hip::copy_peer(
+                    dst.ptr().add(o),
+                    peer.dev,
+                    src.ptr().add(o) as *const f32,
+                    r.dev,
+                    bt.b * self.hp.d,
+                    if side_stream { r.sx } else { r.s },
+                )
+            };
         }
     }
 
@@ -420,39 +555,161 @@ impl Engine {
             let pa = unsafe { r.pa.ptr().add(bt.off * hp.d) };
             self.norm(r, pend, &lw.attn_norm, bt, false);
             match &lw.mixer {
-                Mixer::Gdn { win, wout, conv_w, dt_bias, ssm_a, norm_w } => {
+                Mixer::Gdn {
+                    win,
+                    wout,
+                    conv_w,
+                    dt_bias,
+                    ssm_a,
+                    norm_w,
+                } => {
                     let Sel::Trunk(l) = sel else { unreachable!() };
                     let gb = r.gdn[l].as_ref().unwrap();
                     let y = unsafe { r.y.ptr().add(bt.off * dm.gdn_nin) };
                     self.gemv(r, win, y, bt);
                     let null = std::ptr::null_mut();
-                    let (mix_s, qkv_s) = if bt.big { unsafe { (r.mix_s.ptr().add(bt.mix_row * dm.ch), r.qkv_s.ptr().add(bt.off * (dm.ch + 2 * dm.gv))) } } else { (null, null) };
+                    let (mix_s, qkv_s) = if bt.big {
+                        unsafe {
+                            (
+                                r.mix_s.ptr().add(bt.mix_row * dm.ch),
+                                r.qkv_s.ptr().add(bt.off * (dm.ch + 2 * dm.gv)),
+                            )
+                        }
+                    } else {
+                        (null, null)
+                    };
                     unsafe {
-                        hip::pk_gdn_conv(r.s, y, dm.gdn_nin as i32, gb.mix.ptr(), gb.qkv.ptr(), R as i32, conv_w.ptr(), dt_bias.ptr(), ssm_a.ptr(), dm.gk as i32, dm.gv as i32, hp.eps, mix_s, qkv_s, bi, g);
-                        hip::pk_gdn_step(r.s, gb.state.ptr(), gb.qkv.ptr(), R as i32, y, dm.gdn_nin as i32, norm_w.ptr(), dm.gk as i32, dm.gv as i32, hp.eps, xq, xd, bt.xs, qkv_s, g);
+                        hip::pk_gdn_conv(
+                            r.s,
+                            y,
+                            dm.gdn_nin as i32,
+                            gb.mix.ptr(),
+                            gb.qkv.ptr(),
+                            R as i32,
+                            conv_w.ptr(),
+                            dt_bias.ptr(),
+                            ssm_a.ptr(),
+                            dm.gk as i32,
+                            dm.gv as i32,
+                            hp.eps,
+                            mix_s,
+                            qkv_s,
+                            bi,
+                            g,
+                        );
+                        hip::pk_gdn_step(
+                            r.s,
+                            gb.state.ptr(),
+                            gb.qkv.ptr(),
+                            R as i32,
+                            y,
+                            dm.gdn_nin as i32,
+                            norm_w.ptr(),
+                            dm.gk as i32,
+                            dm.gv as i32,
+                            hp.eps,
+                            xq,
+                            xd,
+                            bt.xs,
+                            qkv_s,
+                            g,
+                        );
                         if bt.big {
                             // Keep the last 3 raw rows as the next step's conv history.
                             for i in 0..g.n as usize {
-                                let (start, len, slot, cur) = (g.start[i] as usize, g.len[i] as usize, g.slot[i] as usize, g.cur[i] as usize);
-                                hip::copy_dev(gb.mix.ptr().add((slot * 2 + cur) * (3 + R) * dm.ch), mix_s.add((start + 3 * i + len) * dm.ch), 3 * dm.ch, r.s);
+                                let (start, len, slot, cur) = (
+                                    g.start[i] as usize,
+                                    g.len[i] as usize,
+                                    g.slot[i] as usize,
+                                    g.cur[i] as usize,
+                                );
+                                hip::copy_dev(
+                                    gb.mix.ptr().add((slot * 2 + cur) * (3 + R) * dm.ch),
+                                    mix_s.add((start + 3 * i + len) * dm.ch),
+                                    3 * dm.ch,
+                                    r.s,
+                                );
                             }
                         }
                     }
                     self.t(r, "gdn");
                     self.gemv(r, wout, pa, bt);
                 }
-                Mixer::Attn { win, wout, q_norm, k_norm } => {
+                Mixer::Attn {
+                    win,
+                    wout,
+                    q_norm,
+                    k_norm,
+                } => {
                     let kv = kv.unwrap();
                     let y = unsafe { r.y.ptr().add(bt.off * dm.attn_nin) };
                     self.gemv(r, win, y, bt);
                     unsafe {
                         let qr = r.qr.ptr().add(bt.off * dm.hq * hp.hd);
-                        let part = r.part.ptr().add(bt.tile_off * dm.hq * bt.segs * hip::ATTN_PART);
-                        hip::pk_attn_prep(r.s, y, dm.attn_nin as i32, dm.hq as i32, dm.hkv as i32, 0, (dm.hq * 2 * hp.hd) as i32, q_norm.ptr(), k_norm.ptr(), hp.eps, hp.theta_scale, hp.n_rot as i32, qr, kv.k.ptr(), kv.v.ptr(), bi, g);
+                        let part = r
+                            .part
+                            .ptr()
+                            .add(bt.tile_off * dm.hq * bt.segs * hip::ATTN_PART);
+                        hip::pk_attn_prep(
+                            r.s,
+                            y,
+                            dm.attn_nin as i32,
+                            dm.hq as i32,
+                            dm.hkv as i32,
+                            0,
+                            (dm.hq * 2 * hp.hd) as i32,
+                            q_norm.ptr(),
+                            k_norm.ptr(),
+                            hp.eps,
+                            hp.theta_scale,
+                            hp.n_rot as i32,
+                            qr,
+                            kv.k.ptr(),
+                            kv.v.ptr(),
+                            bi,
+                            g,
+                        );
                         if bt.big {
-                            hip::pk_attn_swept(r.s, qr, y, dm.attn_nin as i32, dm.hq as i32, dm.hkv as i32, kv.k.ptr(), kv.v.ptr(), bt.seg_tiles, bt.sweep.0, bt.sweep.1, part, bt.tiles as i32, xq, xd, bt.xs, bi, g);
+                            hip::pk_attn_swept(
+                                r.s,
+                                qr,
+                                y,
+                                dm.attn_nin as i32,
+                                dm.hq as i32,
+                                dm.hkv as i32,
+                                kv.k.ptr(),
+                                kv.v.ptr(),
+                                bt.seg_tiles,
+                                bt.sweep.0,
+                                bt.sweep.1,
+                                part,
+                                bt.tiles as i32,
+                                xq,
+                                xd,
+                                bt.xs,
+                                bi,
+                                g,
+                            );
                         } else {
-                            hip::pk_attn(r.s, qr, y, dm.attn_nin as i32, dm.hq as i32, dm.hkv as i32, kv.k.ptr(), kv.v.ptr(), bt.seg_tiles, part, bt.tiles as i32, bt.segs as i32, xq, xd, bt.xs, bi, g);
+                            hip::pk_attn(
+                                r.s,
+                                qr,
+                                y,
+                                dm.attn_nin as i32,
+                                dm.hq as i32,
+                                dm.hkv as i32,
+                                kv.k.ptr(),
+                                kv.v.ptr(),
+                                bt.seg_tiles,
+                                part,
+                                bt.tiles as i32,
+                                bt.segs as i32,
+                                xq,
+                                xd,
+                                bt.xs,
+                                bi,
+                                g,
+                            );
                         }
                     }
                     self.t(r, "attn");
@@ -474,7 +731,12 @@ impl Engine {
             self.gemv(r, &lw.upgate, y, bt);
             unsafe { hip::pk_ffn_act(r.s, y, r.dims.ff as i32, bt.b as i32, xq, xd, bt.xs) };
             self.t(r, "ffn-act");
-            self.gemv(r, &lw.down, unsafe { r.pb.ptr().add(bt.off * self.hp.d) }, bt);
+            self.gemv(
+                r,
+                &lw.down,
+                unsafe { r.pb.ptr().add(bt.off * self.hp.d) },
+                bt,
+            );
         }
     }
 
@@ -482,10 +744,10 @@ impl Engine {
     fn block(&self, sel: Sel, bt: &Batch, pend: Pend) {
         self.mixer_stage(sel, bt, pend);
         self.exchange(true, bt);
-        if let (true, Sel::Trunk(l)) = (self.dump, sel) {
-            if l > 0 {
-                self.dump_h(&format!("l_out-{}", l - 1), bt.b);
-            }
+        if let (true, Sel::Trunk(l)) = (self.dump, sel)
+            && l > 0
+        {
+            self.dump_h(&format!("l_out-{}", l - 1), bt.b);
         }
         self.ffn_stage(sel, bt);
         self.exchange(false, bt);
@@ -498,7 +760,7 @@ impl Engine {
         let stages = 2 * self.hp.n_layer;
         let launch = |k: usize, h: usize| {
             let (sel, bt) = (Sel::Trunk(k / 2), halves[h]);
-            if k % 2 == 0 {
+            if k.is_multiple_of(2) {
                 self.mixer_stage(sel, bt, if k == 0 { Pend::None } else { Pend::B });
             } else {
                 self.ffn_stage(sel, bt);
@@ -512,7 +774,7 @@ impl Engine {
         // copied (side stream) once its stage is computed, and the half's next stage (main
         // stream, both cards) starts once both copies have landed.
         for k in 0..stages {
-            for h in 0..2 {
+            for (h, half) in halves.iter().enumerate() {
                 if k > 0 {
                     for (i, r) in self.ranks.iter().enumerate() {
                         hip::set_device(r.dev);
@@ -524,7 +786,7 @@ impl Engine {
                     hip::set_device(r.dev);
                     hip::stream_wait_event(r.sx, r.ev_done[h]);
                 }
-                self.peer_copy(k % 2 == 0, halves[h], true);
+                self.peer_copy(k.is_multiple_of(2), half, true);
                 for r in &self.ranks {
                     hip::set_device(r.dev);
                     hip::event_record(r.ev_copied[h], r.sx);
@@ -553,9 +815,29 @@ impl Engine {
             self.norm(r, Pend::B, w, bt, true);
             let (xq, xd) = r.act(bt);
             unsafe {
-                hip::pk_gemm(r.s, head.qs.ptr(), head.d.ptr(), xq, xd, bt.xs, first as i32, r.logits.ptr(), head.rows as i64, head.cols as i32, n as i32, head.rows as i32);
+                hip::pk_gemm(
+                    r.s,
+                    head.qs.ptr(),
+                    head.d.ptr(),
+                    xq,
+                    xd,
+                    bt.xs,
+                    first as i32,
+                    r.logits.ptr(),
+                    head.rows as i64,
+                    head.cols as i32,
+                    n as i32,
+                    head.rows as i32,
+                );
                 self.t(r, "gemv-head");
-                hip::pk_argmax(r.s, r.logits.ptr(), head.rows as i64, head.rows as i64, n as i32, r.best.ptr());
+                hip::pk_argmax(
+                    r.s,
+                    r.logits.ptr(),
+                    head.rows as i64,
+                    head.rows as i64,
+                    n as i32,
+                    r.best.ptr(),
+                );
             }
         }
         n
@@ -566,10 +848,14 @@ impl Engine {
         let mut errs = vec![[0i32]; self.ranks.len()];
         for (r, e) in self.ranks.iter().zip(errs.iter_mut()) {
             hip::set_device(r.dev);
-            r.err.download(e, r.s);
+            // SAFETY: err is initialized; errs stays exclusively borrowed until sync_all below.
+            unsafe { r.err.download(e, r.s) };
         }
         self.sync_all();
-        assert!(errs.iter().all(|e| e[0] == 0), "cross-card exchange timed out ({errs:?}): the ranks lost step with each other");
+        assert!(
+            errs.iter().all(|e| e[0] == 0),
+            "cross-card exchange timed out ({errs:?}): the ranks lost step with each other"
+        );
     }
 
     /// Trunk head: greedy pick per scored row, merged across ranks on the host. Synchronises.
@@ -578,17 +864,24 @@ impl Engine {
         let mut best = vec![vec![0i32; b * 2]; self.ranks.len()];
         for (r, out) in self.ranks.iter().zip(best.iter_mut()) {
             hip::set_device(r.dev);
-            r.best.download(out, r.s);
+            // SAFETY: head_launch initializes best; out stays untouched until finish synchronizes.
+            unsafe { r.best.download(out, r.s) };
         }
         self.finish();
         (0..b)
             .map(|i| {
                 // Highest logit across ranks; the lower vocab range wins ties.
-                let mut out = RowOut { token: 0, logit: f32::NEG_INFINITY };
+                let mut out = RowOut {
+                    token: 0,
+                    logit: f32::NEG_INFINITY,
+                };
                 for (r, bst) in self.ranks.iter().zip(&best) {
                     let logit = f32::from_bits(bst[i * 2] as u32);
                     if logit > out.logit {
-                        out = RowOut { token: (r.dims.vocab0 + bst[i * 2 + 1] as usize) as u32, logit };
+                        out = RowOut {
+                            token: (r.dims.vocab0 + bst[i * 2 + 1] as usize) as u32,
+                            logit,
+                        };
                     }
                 }
                 out
@@ -611,7 +904,18 @@ impl Engine {
             for (i, r) in self.ranks.iter().enumerate() {
                 hip::set_device(r.dev);
                 unsafe {
-                    hip::pk_xchg(r.s, r.best.ptr() as *const f32, data.add((i * 2 + half) * area), flags.add(i * XCHG_FLAGS), data.add(((1 - i) * 2 + half) * area), flags.add((1 - i) * XCHG_FLAGS), r.best_peer.ptr() as *mut f32, (b * 2) as i32, seq, r.err.ptr());
+                    hip::pk_xchg(
+                        r.s,
+                        r.best.ptr() as *const f32,
+                        data.add((i * 2 + half) * area),
+                        flags.add(i * XCHG_FLAGS),
+                        data.add(((1 - i) * 2 + half) * area),
+                        flags.add((1 - i) * XCHG_FLAGS),
+                        r.best_peer.ptr() as *mut f32,
+                        (b * 2) as i32,
+                        seq,
+                        r.err.ptr(),
+                    );
                 }
             }
         }
@@ -619,8 +923,23 @@ impl Engine {
             hip::set_device(r.dev);
             let v0 = |r: &Rank| r.w.mtp.as_ref().unwrap().draft_v0 as i32;
             // With one rank the "peer" is the rank itself: same pair, same answer.
-            let (peer_best, peer_v0) = if self.ranks.len() == 2 { (r.best_peer.ptr(), v0(&self.ranks[1 - i])) } else { (r.best.ptr(), v0(r)) };
-            unsafe { hip::pk_pick(r.s, r.best.ptr(), peer_best, v0(r), peer_v0, r.tokens.ptr(), r.drafted.ptr().add(step * BMAX), b as i32) };
+            let (peer_best, peer_v0) = if self.ranks.len() == 2 {
+                (r.best_peer.ptr(), v0(&self.ranks[1 - i]))
+            } else {
+                (r.best.ptr(), v0(r))
+            };
+            unsafe {
+                hip::pk_pick(
+                    r.s,
+                    r.best.ptr(),
+                    peer_best,
+                    v0(r),
+                    peer_v0,
+                    r.tokens.ptr(),
+                    r.drafted.ptr().add(step * BMAX),
+                    b as i32,
+                )
+            };
         }
     }
 
@@ -634,19 +953,46 @@ impl Engine {
             tiles += len.div_ceil(16);
             // The last tile reaches furthest; its slot range is [0, p] or [base - p, base].
             let p = pos0 + len - 1;
-            let (lo, hi) = if g.kv_dir[i] > 0 { (0, p) } else { (g.kv_base[i] as usize - p, g.kv_base[i] as usize) };
+            let (lo, hi) = if g.kv_dir[i] > 0 {
+                (0, p)
+            } else {
+                (g.kv_base[i] as usize - p, g.kv_base[i] as usize)
+            };
             if b <= R {
                 segs = segs.max(hi / hip::ATTN_SEG_SLOTS - lo / hip::ATTN_SEG_SLOTS + 1);
             }
-            sweep = (sweep.0.min((lo / hip::ATTN_SWEEP_SLOTS) as i32), sweep.1.max((hi / hip::ATTN_SWEEP_SLOTS) as i32));
+            sweep = (
+                sweep.0.min((lo / hip::ATTN_SWEEP_SLOTS) as i32),
+                sweep.1.max((hi / hip::ATTN_SWEEP_SLOTS) as i32),
+            );
         }
         // A large batch keeps one partial per row tile and sweeps the cache in long stretches.
-        let seg_tiles = (if b > R { hip::ATTN_SWEEP_SLOTS } else { hip::ATTN_SEG_SLOTS } / 16) as i32;
+        let seg_tiles = (if b > R {
+            hip::ATTN_SWEEP_SLOTS
+        } else {
+            hip::ATTN_SEG_SLOTS
+        } / 16) as i32;
         // A second half sits after the first in every scratch area: 3 history rows + rows in
         // the GDN scratch, whole row tiles in the attention scratch.
-        let (mix_row, tile_off) = if off == 0 { (0, 0) } else { (3 + off, off.div_ceil(16)) };
+        let (mix_row, tile_off) = if off == 0 {
+            (0, 0)
+        } else {
+            (3 + off, off.div_ceil(16))
+        };
         assert!(tile_off + tiles <= attn_tiles(self.rows));
-        Batch { g, b, off, mix_row, tile_off, tiles, segs: if b > R { 1 } else { segs }, seg_tiles, sweep, big: b > R, xs: xs(total) }
+        Batch {
+            g,
+            b,
+            off,
+            mix_row,
+            tile_off,
+            tiles,
+            segs: if b > R { 1 } else { segs },
+            seg_tiles,
+            sweep,
+            big: b > R,
+            xs: xs(total),
+        }
     }
 
     fn kv_groups(&self, i: usize, slot: usize, g: &mut Groups) {
@@ -663,9 +1009,45 @@ impl Engine {
         let null = std::ptr::null();
         let (xq, xd) = r.act(bt);
         unsafe {
-            hip::pk_embed(r.s, r.w.embd.qs.ptr(), r.w.embd.d.ptr(), r.tokens.ptr().add(bt.off), r.emb.ptr().add(o), d, bi);
-            hip::pk_norm_quant(r.s, r.emb.ptr().add(o), null, null, m.enorm.ptr(), self.hp.eps, d, bi, xq, xd, bt.xs, 0, std::ptr::null_mut());
-            hip::pk_norm_quant(r.s, r.hin.ptr().add(o), null, null, m.hnorm.ptr(), self.hp.eps, d, bi, xq, xd, bt.xs, d, std::ptr::null_mut());
+            hip::pk_embed(
+                r.s,
+                r.w.embd.qs.ptr(),
+                r.w.embd.d.ptr(),
+                r.tokens.ptr().add(bt.off),
+                r.emb.ptr().add(o),
+                d,
+                bi,
+            );
+            hip::pk_norm_quant(
+                r.s,
+                r.emb.ptr().add(o),
+                null,
+                null,
+                m.enorm.ptr(),
+                self.hp.eps,
+                d,
+                bi,
+                xq,
+                xd,
+                bt.xs,
+                0,
+                std::ptr::null_mut(),
+            );
+            hip::pk_norm_quant(
+                r.s,
+                r.hin.ptr().add(o),
+                null,
+                null,
+                m.hnorm.ptr(),
+                self.hp.eps,
+                d,
+                bi,
+                xq,
+                xd,
+                bt.xs,
+                d,
+                std::ptr::null_mut(),
+            );
             self.gemv(r, &m.eh_proj, r.h.ptr().add(o), bt);
         }
     }
@@ -678,15 +1060,37 @@ impl Engine {
         for r in self.ranks.iter().filter(|r| r.w.mtp.is_some()) {
             hip::set_device(r.dev);
             let m = r.w.mtp.as_ref().unwrap();
-            let Mixer::Attn { win, q_norm, k_norm, .. } = &m.layer.mixer else { unreachable!() };
+            let Mixer::Attn {
+                win,
+                q_norm,
+                k_norm,
+                ..
+            } = &m.layer.mixer
+            else {
+                unreachable!()
+            };
             let kv = r.mtp_kv.as_ref().unwrap();
             let dm = &r.dims;
             for i in 0..bt.g.n as usize {
-                let (start, len, slot) = (bt.off + bt.g.start[i] as usize, bt.g.len[i] as usize, bt.g.slot[i] as usize);
+                let (start, len, slot) = (
+                    bt.off + bt.g.start[i] as usize,
+                    bt.g.len[i] as usize,
+                    bt.g.slot[i] as usize,
+                );
                 unsafe {
-                    hip::copy_dev(r.hin.ptr().add(start * d), r.hprev.ptr().add(slot * d), d, r.s);
+                    hip::copy_dev(
+                        r.hin.ptr().add(start * d),
+                        r.hprev.ptr().add(slot * d),
+                        d,
+                        r.s,
+                    );
                     if len > 1 {
-                        hip::copy_dev(r.hin.ptr().add((start + 1) * d), r.xf.ptr().add(start * d), (len - 1) * d, r.s);
+                        hip::copy_dev(
+                            r.hin.ptr().add((start + 1) * d),
+                            r.xf.ptr().add(start * d),
+                            (len - 1) * d,
+                            r.s,
+                        );
                     }
                 }
             }
@@ -698,8 +1102,39 @@ impl Engine {
             let (xq, xd) = r.act(bt);
             unsafe {
                 let y = r.y.ptr().add(bt.off * kv_rows);
-                hip::pk_gemm(r.s, win.qs.ptr().add(q_rows * win.cols), win.d.ptr().add(q_rows * win.cols / 32), xq, xd, bt.xs, 0, y, kv_rows as i64, win.cols as i32, bt.b as i32, kv_rows as i32);
-                hip::pk_attn_prep(r.s, y, kv_rows as i32, dm.hq as i32, dm.hkv as i32, dm.hq as i32, 0, q_norm.ptr(), k_norm.ptr(), hp.eps, hp.theta_scale, hp.n_rot as i32, r.qr.ptr(), kv.k.ptr(), kv.v.ptr(), bt.b as i32, &bt.g);
+                hip::pk_gemm(
+                    r.s,
+                    win.qs.ptr().add(q_rows * win.cols),
+                    win.d.ptr().add(q_rows * win.cols / 32),
+                    xq,
+                    xd,
+                    bt.xs,
+                    0,
+                    y,
+                    kv_rows as i64,
+                    win.cols as i32,
+                    bt.b as i32,
+                    kv_rows as i32,
+                );
+                hip::pk_attn_prep(
+                    r.s,
+                    y,
+                    kv_rows as i32,
+                    dm.hq as i32,
+                    dm.hkv as i32,
+                    dm.hq as i32,
+                    0,
+                    q_norm.ptr(),
+                    k_norm.ptr(),
+                    hp.eps,
+                    hp.theta_scale,
+                    hp.n_rot as i32,
+                    r.qr.ptr(),
+                    kv.k.ptr(),
+                    kv.v.ptr(),
+                    bt.b as i32,
+                    &bt.g,
+                );
             }
         }
     }
@@ -713,7 +1148,10 @@ impl Engine {
         let first: Vec<i32> = last.iter().map(|&(_, t)| t as i32).collect();
         let t_draft = Instant::now();
         for step in 0..n_max {
-            let mut g = Groups { n: b as i32, ..Default::default() };
+            let mut g = Groups {
+                n: b as i32,
+                ..Default::default()
+            };
             for (i, &(slot, _)) in last.iter().enumerate() {
                 assert!(!self.seqs[slot].awaiting_accept);
                 g.start[i] = i as i32;
@@ -725,11 +1163,16 @@ impl Engine {
             for r in &self.ranks {
                 hip::set_device(r.dev);
                 if step == 0 {
-                    r.tokens.upload(&first, r.s);
+                    // SAFETY: first and tokens remain live and unchanged until finish below.
+                    unsafe { r.tokens.upload(&first, r.s) };
                 }
                 // h input: the trunk's last accepted hidden first, then the head's own output.
                 for (i, &(slot, _)) in last.iter().enumerate() {
-                    let src = if step == 0 { unsafe { r.hprev.ptr().add(slot * d) } } else { unsafe { r.xf.ptr().add(i * d) } };
+                    let src = if step == 0 {
+                        unsafe { r.hprev.ptr().add(slot * d) }
+                    } else {
+                        unsafe { r.xf.ptr().add(i * d) }
+                    };
                     unsafe { hip::copy_dev(r.hin.ptr().add(i * d), src, d, r.s) };
                 }
                 self.mtp_input(r, &bt);
@@ -740,25 +1183,53 @@ impl Engine {
         let mut hist = vec![0i32; n_max * BMAX];
         let r0 = &self.ranks[0];
         hip::set_device(r0.dev);
-        r0.drafted.download(&mut hist, r0.s);
+        // SAFETY: the draft head initializes hist rows; hist stays untouched until finish below.
+        unsafe { r0.drafted.download(&mut hist, r0.s) };
         self.finish();
         if std::env::var_os("FCL_TRACE").is_some() {
-            eprintln!("draft x{n_max}: {:.2} ms", t_draft.elapsed().as_secs_f64() * 1e3);
+            eprintln!(
+                "draft x{n_max}: {:.2} ms",
+                t_draft.elapsed().as_secs_f64() * 1e3
+            );
         }
-        (0..b).map(|i| (0..n_max).map(|step| hist[step * BMAX + i] as u32).collect()).collect()
+        (0..b)
+            .map(|i| {
+                (0..n_max)
+                    .map(|step| hist[step * BMAX + i] as u32)
+                    .collect()
+            })
+            .collect()
     }
 
     /// Open a group of `n` rows for `slot` starting at batch row `start`: fill its entry of `g`
     /// from the sequence's state and advance that state past this step.
-    fn open_group(&mut self, g: &mut Groups, i: usize, slot: usize, start: usize, n: usize, commit: bool) {
+    fn open_group(
+        &mut self,
+        g: &mut Groups,
+        i: usize,
+        slot: usize,
+        start: usize,
+        n: usize,
+        commit: bool,
+    ) {
         let s = self.seqs[slot];
-        assert!(!s.awaiting_accept, "slot {slot}: accept() the previous step first");
-        assert!(n > 0 && (n <= R || commit), "only committed batches may exceed {R} rows");
+        assert!(
+            !s.awaiting_accept,
+            "slot {slot}: accept() the previous step first"
+        );
+        assert!(
+            n > 0 && (n <= R || commit),
+            "only committed batches may exceed {R} rows"
+        );
         g.start[i] = start as i32;
         g.len[i] = n as i32;
         g.cur[i] = 1 - s.cur;
         g.hist_off[i] = s.last_acc as i32;
-        g.nacc[i] = if s.last_committed { 0 } else { s.last_acc as i32 };
+        g.nacc[i] = if s.last_committed {
+            0
+        } else {
+            s.last_acc as i32
+        };
         g.commit[i] = commit as i32;
         g.pos0[i] = s.len as i32;
         self.kv_groups(i, slot, g);
@@ -777,7 +1248,17 @@ impl Engine {
     fn embed(&self, bt: &Batch) {
         for r in &self.ranks {
             hip::set_device(r.dev);
-            unsafe { hip::pk_embed(r.s, r.w.embd.qs.ptr(), r.w.embd.d.ptr(), r.tokens.ptr().add(bt.off), r.h.ptr().add(bt.off * self.hp.d), self.hp.d as i32, bt.b as i32) };
+            unsafe {
+                hip::pk_embed(
+                    r.s,
+                    r.w.embd.qs.ptr(),
+                    r.w.embd.d.ptr(),
+                    r.tokens.ptr().add(bt.off),
+                    r.h.ptr().add(bt.off * self.hp.d),
+                    self.hp.d as i32,
+                    bt.b as i32,
+                )
+            };
         }
     }
 
@@ -786,25 +1267,45 @@ impl Engine {
     /// either commits (prefill) or stays pending; pending groups must be `accept`ed before any
     /// other call.
     pub fn step(&mut self, rows: &[(usize, &[u32], bool)]) -> Vec<RowOut> {
-        let tokens: Vec<i32> = rows.iter().flat_map(|r| r.1.iter().map(|&t| t as i32)).collect();
+        assert!(
+            rows.iter()
+                .flat_map(|row| row.1)
+                .all(|&id| { (id as usize) < self.hp.vocab && i32::try_from(id).is_ok() }),
+            "token ID outside embedding table or kernel range"
+        );
+        let tokens: Vec<i32> = rows
+            .iter()
+            .flat_map(|r| r.1.iter().map(|&t| t as i32))
+            .collect();
         let b = tokens.len();
-        assert!(b <= self.rows && (b <= BMAX || rows.len() == 1), "a large batch carries one sequence");
-        assert!(self.seqs.iter().map(|s| s.len).sum::<usize>() + b <= self.cap, "KV pool full");
+        assert!(
+            b <= self.rows && (b <= BMAX || rows.len() == 1),
+            "a large batch carries one sequence"
+        );
+        assert!(
+            self.seqs.iter().map(|s| s.len).sum::<usize>() + b <= self.cap,
+            "KV pool full"
+        );
         for r in &self.ranks {
             hip::set_device(r.dev);
-            r.tokens.upload(&tokens, r.s);
+            // SAFETY: tokens remains live and unchanged until head synchronizes this step.
+            unsafe { r.tokens.upload(&tokens, r.s) };
         }
         let t_step = Instant::now();
 
         // Two cards and a batch too big for the on-card exchange: run it as two interleaved
         // halves so the bulk card-to-card transfers overlap compute.
         let paired = self.ranks.len() == 2 && b > XCHG_ROWS && self.prof.is_none() && !self.dump;
-        let out = if paired {
+
+        if paired {
             let (slot, _, commit) = rows[0];
             let first = (b / 2).next_multiple_of(16);
             let mut halves = Vec::new();
             for (off, n) in [(0, first), (first, b - first)] {
-                let mut g = Groups { n: 1, ..Default::default() };
+                let mut g = Groups {
+                    n: 1,
+                    ..Default::default()
+                };
                 self.open_group(&mut g, 0, slot, 0, n, commit);
                 halves.push(self.batch(g, n, off, b));
             }
@@ -823,7 +1324,10 @@ impl Engine {
             self.save_hprev(slot, b - 1);
             out
         } else {
-            let mut g = Groups { n: rows.len() as i32, ..Default::default() };
+            let mut g = Groups {
+                n: rows.len() as i32,
+                ..Default::default()
+            };
             let mut start = 0;
             for (i, &(slot, toks, commit)) in rows.iter().enumerate() {
                 self.open_group(&mut g, i, slot, start, toks.len(), commit);
@@ -839,7 +1343,11 @@ impl Engine {
             let t_enq = Instant::now();
             let out = self.head(&bt);
             if std::env::var_os("FCL_TRACE").is_some() {
-                eprintln!("step b={b}: enqueue {:.2} ms, then wait {:.2} ms", (t_enq - t_step).as_secs_f64() * 1e3, t_enq.elapsed().as_secs_f64() * 1e3);
+                eprintln!(
+                    "step b={b}: enqueue {:.2} ms, then wait {:.2} ms",
+                    (t_enq - t_step).as_secs_f64() * 1e3,
+                    t_enq.elapsed().as_secs_f64() * 1e3
+                );
             }
             if self.dump {
                 self.dump_h(&format!("l_out-{}", self.hp.n_layer - 1), b);
@@ -851,8 +1359,7 @@ impl Engine {
                 }
             }
             out
-        };
-        out
+        }
     }
 
     /// Copy the last row's full logits (all ranks, vocab order) to the host.
@@ -861,7 +1368,14 @@ impl Engine {
         for r in &self.ranks {
             hip::set_device(r.dev);
             let dst = &mut out[r.dims.vocab0..r.dims.vocab0 + r.dims.vocab];
-            unsafe { hip::download_raw(dst.as_mut_ptr() as *mut u8, r.logits.ptr().add(row * r.dims.vocab) as *const u8, dst.len() * 4, r.s) };
+            unsafe {
+                hip::download_raw(
+                    dst.as_mut_ptr() as *mut u8,
+                    r.logits.ptr().add(row * r.dims.vocab) as *const u8,
+                    dst.len() * 4,
+                    r.s,
+                )
+            };
             hip::sync(r.s);
         }
         out
@@ -872,10 +1386,19 @@ impl Engine {
         hip::set_device(r.dev);
         hip::sync(r.s);
         let mut h = vec![0f32; b * self.hp.d];
-        r.h.download(&mut h, r.s);
+        // SAFETY: the trunk initialized these rows; h stays untouched until sync below.
+        unsafe { r.h.download(&mut h, r.s) };
         hip::sync(r.s);
         let row = &h[(b - 1) * self.hp.d..];
         let sum: f64 = h.iter().map(|&v| v as f64).sum();
-        println!("{name}: sum {sum:.6} first [{:.4}, {:.4}, {:.4}] last [{:.4}, {:.4}, {:.4}]", row[0], row[1], row[2], row[self.hp.d - 3], row[self.hp.d - 2], row[self.hp.d - 1]);
+        println!(
+            "{name}: sum {sum:.6} first [{:.4}, {:.4}, {:.4}] last [{:.4}, {:.4}, {:.4}]",
+            row[0],
+            row[1],
+            row[2],
+            row[self.hp.d - 3],
+            row[self.hp.d - 2],
+            row[self.hp.d - 1]
+        );
     }
 }

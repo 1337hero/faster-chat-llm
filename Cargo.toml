@@ -23,3 +23,6 @@ inherits = "release"
 lto = "off"
 codegen-units = 16
 incremental = true
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"

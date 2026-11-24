@@ -191,6 +191,7 @@ pub fn pretokenise(text: &str) -> Vec<String> {
             }
             end = match (i..j).rev().find(|&k| matches!(cs[k], '\r' | '\n')) {
                 Some(k) => Some(k + 1),
+                None if j < n && j - i > 1 => Some(j - 1),
                 None => Some(j),
             };
         }
@@ -203,8 +204,6 @@ pub fn pretokenise(text: &str) -> Vec<String> {
 }
 
 pub struct Tokenizer {
-    /// Byte-level token string -> id.
-    token_to_id: HashMap<String, u32>,
     id_to_bytes: Vec<Vec<u8>>,
     /// (left sym, right sym) -> (rank, merged sym)
     merges: HashMap<(u32, u32), (u32, u32)>,
@@ -267,7 +266,7 @@ impl Tokenizer {
                 specials.push((id as u32, s.clone()));
             }
         }
-        specials.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+        specials.sort_by_key(|token| std::cmp::Reverse(token.1.len()));
 
         let mut sym_bytes: Vec<Vec<u8>> = (0u8..=255).map(|b| vec![b]).collect();
         let mut sym_id: HashMap<Vec<u8>, u32> = sym_bytes
@@ -296,7 +295,10 @@ impl Tokenizer {
             };
             // Merge sides are written as symbol *strings*, so a side can be a multi-byte
             // symbol that this file never produced as a merge result. Intern on demand.
-            let mut intern = |bytes: Vec<u8>, sym_bytes: &mut Vec<Vec<u8>>, sym_id: &mut HashMap<Vec<u8>, u32>| -> u32 {
+            let intern = |bytes: Vec<u8>,
+                          sym_bytes: &mut Vec<Vec<u8>>,
+                          sym_id: &mut HashMap<Vec<u8>, u32>|
+             -> u32 {
                 if let Some(&id) = sym_id.get(&bytes) {
                     return id;
                 }
@@ -325,7 +327,6 @@ impl Tokenizer {
             .collect();
 
         Ok(Self {
-            token_to_id,
             id_to_bytes,
             merges: merges_map,
             sym_bytes,
@@ -340,6 +341,22 @@ impl Tokenizer {
 
     pub fn vocab_size(&self) -> usize {
         self.id_to_bytes.len()
+    }
+
+    pub fn validate_id(&self, value: u64) -> Result<u32, String> {
+        let id = u32::try_from(value).map_err(|_| format!("token ID {value} exceeds u32"))?;
+        self.validate_ids(&[id])?;
+        Ok(id)
+    }
+
+    pub fn validate_ids(&self, ids: &[u32]) -> Result<(), String> {
+        if let Some(id) = ids
+            .iter()
+            .find(|&&id| id as usize >= self.vocab_size() || id > i32::MAX as u32)
+        {
+            return Err(format!("token ID {id} outside vocabulary or kernel range"));
+        }
+        Ok(())
     }
 
     pub fn decode_id(&self, id: u32) -> &[u8] {
@@ -362,10 +379,10 @@ impl Tokenizer {
             // lowest-rank adjacent pair; ties impossible (ranks are unique)
             let mut best: Option<(u32, usize, u32)> = None;
             for i in 0..syms.len().saturating_sub(1) {
-                if let Some(&(rank, merged)) = self.merges.get(&(syms[i], syms[i + 1])) {
-                    if best.is_none_or(|(r, _, _)| rank < r) {
-                        best = Some((rank, i, merged));
-                    }
+                if let Some(&(rank, merged)) = self.merges.get(&(syms[i], syms[i + 1]))
+                    && best.is_none_or(|(r, _, _)| rank < r)
+                {
+                    best = Some((rank, i, merged));
                 }
             }
             let (_, idx, merged) = match best {
@@ -388,10 +405,10 @@ impl Tokenizer {
         while !rest.is_empty() {
             let mut hit: Option<(usize, u32, usize)> = None;
             for (id, s) in &self.specials {
-                if let Some(pos) = rest.find(s.as_str()) {
-                    if hit.is_none_or(|(p, _, _)| pos < p) {
-                        hit = Some((pos, *id, s.len()));
-                    }
+                if let Some(pos) = rest.find(s.as_str())
+                    && hit.is_none_or(|(p, _, _)| pos < p)
+                {
+                    hit = Some((pos, *id, s.len()));
                 }
             }
             match hit {

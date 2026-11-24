@@ -94,12 +94,12 @@ impl GgmlType {
             F16 | BF16 | I16 => 2,
             F64 | I64 => 8,
             I8 => 1,
-            Q4_0 => 2 + 16,        // d:f16 + 16 bytes of 4-bit pairs
+            Q4_0 => 2 + 16, // d:f16 + 16 bytes of 4-bit pairs
             Q4_1 => 2 + 2 + 16,
             Q5_0 => 2 + 4 + 16,
             Q5_1 => 2 + 2 + 4 + 16,
-            Q8_0 => 2 + 32,        // d:f16 + 32 int8
-            Q8_1 => 2 + 2 + 32,    // d:f16 + s:f16 + 32 int8
+            Q8_0 => 2 + 32,     // d:f16 + 32 int8
+            Q8_1 => 2 + 2 + 32, // d:f16 + s:f16 + 32 int8
             Q2K => 256 / 4 + 2 + 2 + 2 + 2,
             Q3K => 256 / 4 + 2 + 1 + 12 + 2 + 2,
             Q4K => 256 / 2 + 2 + 2 + 12,
@@ -122,7 +122,10 @@ impl GgmlType {
     }
 
     pub fn is_supported(self) -> bool {
-        matches!(self, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 | GgmlType::Q8_0)
+        matches!(
+            self,
+            GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 | GgmlType::Q8_0
+        )
     }
 
     pub fn name(self) -> &'static str {
@@ -182,7 +185,10 @@ pub enum MetaValue {
     F32(f32),
     Bool(bool),
     String(String),
-    Array { item_type: u32, items: Vec<MetaValue> },
+    Array {
+        item_type: u32,
+        items: Vec<MetaValue>,
+    },
     U64(u64),
     I64(i64),
     F64(f64),
@@ -245,7 +251,11 @@ impl fmt::Display for MetaValue {
                 Ok(())
             }
             MetaValue::String(s) => {
-                let one_line: String = s.chars().take(60).map(|c| if c == '\n' { ' ' } else { c }).collect();
+                let one_line: String = s
+                    .chars()
+                    .take(60)
+                    .map(|c| if c == '\n' { ' ' } else { c })
+                    .collect();
                 if s.chars().count() > 60 {
                     write!(f, "\"{one_line}…\" ({} chars)", s.chars().count())
                 } else {

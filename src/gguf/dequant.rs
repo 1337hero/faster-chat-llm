@@ -24,11 +24,12 @@ impl BlockQ8_0 {
         Self { d, qs }
     }
 
+    #[cfg(test)]
     pub fn dot(&self, x: &[f32]) -> f32 {
         debug_assert_eq!(x.len(), QK8_0);
         let mut sum = 0.0f32;
-        for i in 0..QK8_0 {
-            sum += self.qs[i] as f32 * x[i];
+        for (&q, &value) in self.qs.iter().zip(x) {
+            sum += q as f32 * value;
         }
         sum * self.d
     }
@@ -43,8 +44,7 @@ pub fn f16_bits_to_f32(bits: u16) -> f32 {
         if frac == 0 {
             0.0
         } else {
-            let m = frac as f32 * 2f32.powi(-24);
-            m
+            frac as f32 * 2f32.powi(-24)
         }
     } else if exp == 0x1f {
         if frac == 0 { f32::INFINITY } else { f32::NAN }

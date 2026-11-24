@@ -9,13 +9,13 @@ use std::sync::mpsc::Receiver;
 use serde_json::{Map, Value, json};
 
 use crate::chat::ChatTemplate;
-use crate::sched::{Done, Event};
 use crate::sampler::SampleParams;
+use crate::sched::{Done, Event};
 use crate::tokenizer::Tokenizer;
 
 use super::internal::{GenRequest, Thinking, anthropic_error};
 use super::openai_chat::ThinkSplit;
-use super::toolcall::{ToolCallParser, ToolCall, tool_calls_to_anthropic};
+use super::toolcall::{ToolCall, ToolCallParser, tool_calls_to_anthropic};
 
 /// Parse an Anthropic messages request into a GenRequest.
 pub fn parse_request(
@@ -44,7 +44,10 @@ pub fn parse_request(
     kwargs.insert("enable_thinking".into(), Value::Bool(wants_thinking));
 
     let prompt_text = template.render(&messages, tools.as_ref(), &kwargs)?;
-    let thinking_enabled = kwargs.get("enable_thinking").and_then(Value::as_bool).unwrap_or(true);
+    let thinking_enabled = kwargs
+        .get("enable_thinking")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
 
     // Extract sampling params (Anthropic names)
     let f = |k: &str| req.get(k).and_then(Value::as_f64);
@@ -61,7 +64,10 @@ pub fn parse_request(
 
     // Extract stop sequences
     let stop = match req.get("stop_sequences") {
-        Some(Value::Array(a)) => a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
+        Some(Value::Array(a)) => a
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
         _ => Vec::new(),
     };
 
@@ -74,7 +80,11 @@ pub fn parse_request(
         max_tokens,
         sampling,
         stop,
-        thinking: if thinking_enabled { Thinking::Enabled } else { Thinking::Disabled },
+        thinking: if thinking_enabled {
+            Thinking::Enabled
+        } else {
+            Thinking::Disabled
+        },
         stream,
         stream_include_usage: false,
         echo: false,
@@ -94,7 +104,8 @@ fn convert_messages_to_openai(req: &Value) -> Result<Value, String> {
         }
         Some(Value::Array(blocks)) => {
             // System as array of blocks
-            let text: String = blocks.iter()
+            let text: String = blocks
+                .iter()
                 .filter_map(|b| {
                     if b.get("type").and_then(Value::as_str) == Some("text") {
                         b.get("text").and_then(Value::as_str).map(str::to_string)
@@ -112,7 +123,10 @@ fn convert_messages_to_openai(req: &Value) -> Result<Value, String> {
     }
 
     // Convert each message
-    let msgs = req.get("messages").and_then(Value::as_array).ok_or("missing messages")?;
+    let msgs = req
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or("missing messages")?;
     for msg in msgs {
         let role = msg.get("role").and_then(Value::as_str).unwrap_or("user");
 
@@ -122,21 +136,28 @@ fn convert_messages_to_openai(req: &Value) -> Result<Value, String> {
             }
             Some(Value::Array(blocks)) => {
                 // Convert content blocks
-                let (text, tool_calls, tool_results) = parse_content_blocks(blocks)?;
+                let ContentBlocks {
+                    text,
+                    tool_calls,
+                    tool_results,
+                } = parse_content_blocks(blocks)?;
 
                 if role == "assistant" {
                     if !tool_calls.is_empty() {
                         // Assistant with tool calls
-                        let tc: Vec<Value> = tool_calls.iter().map(|(id, name, input)| {
-                            json!({
-                                "id": id,
-                                "type": "function",
-                                "function": {
-                                    "name": name,
-                                    "arguments": input.to_string()
-                                }
+                        let tc: Vec<Value> = tool_calls
+                            .iter()
+                            .map(|(id, name, input)| {
+                                json!({
+                                    "id": id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": name,
+                                        "arguments": input.to_string()
+                                    }
+                                })
                             })
-                        }).collect();
+                            .collect();
                         let mut m = json!({"role": "assistant", "tool_calls": tc});
                         if !text.is_empty() {
                             m["content"] = Value::String(text);
@@ -170,8 +191,13 @@ fn convert_messages_to_openai(req: &Value) -> Result<Value, String> {
     Ok(Value::Array(messages))
 }
 
-/// Parse Anthropic content blocks, returning (text, tool_calls, tool_results).
-fn parse_content_blocks(blocks: &[Value]) -> Result<(String, Vec<(String, String, Value)>, Vec<(String, String)>), String> {
+struct ContentBlocks {
+    text: String,
+    tool_calls: Vec<(String, String, Value)>,
+    tool_results: Vec<(String, String)>,
+}
+
+fn parse_content_blocks(blocks: &[Value]) -> Result<ContentBlocks, String> {
     let mut text_parts = Vec::new();
     let mut tool_calls = Vec::new();
     let mut tool_results = Vec::new();
@@ -190,27 +216,38 @@ fn parse_content_blocks(blocks: &[Value]) -> Result<(String, Vec<(String, String
                 }
             }
             Some("tool_use") => {
-                let id = block.get("id").and_then(Value::as_str).unwrap_or("").to_string();
-                let name = block.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+                let id = block
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let name = block
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
                 let input = block.get("input").cloned().unwrap_or(json!({}));
                 tool_calls.push((id, name, input));
             }
             Some("tool_result") => {
-                let id = block.get("tool_use_id").and_then(Value::as_str).unwrap_or("").to_string();
+                let id = block
+                    .get("tool_use_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
                 let content = match block.get("content") {
                     Some(Value::String(s)) => s.clone(),
-                    Some(Value::Array(arr)) => {
-                        arr.iter()
-                            .filter_map(|b| {
-                                if b.get("type").and_then(Value::as_str) == Some("text") {
-                                    b.get("text").and_then(Value::as_str).map(str::to_string)
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    }
+                    Some(Value::Array(arr)) => arr
+                        .iter()
+                        .filter_map(|b| {
+                            if b.get("type").and_then(Value::as_str) == Some("text") {
+                                b.get("text").and_then(Value::as_str).map(str::to_string)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
                     _ => String::new(),
                 };
                 tool_results.push((id, content));
@@ -222,31 +259,47 @@ fn parse_content_blocks(blocks: &[Value]) -> Result<(String, Vec<(String, String
         }
     }
 
-    Ok((text_parts.join("\n"), tool_calls, tool_results))
+    Ok(ContentBlocks {
+        text: text_parts.join("\n"),
+        tool_calls,
+        tool_results,
+    })
 }
 
 /// Convert Anthropic tools to OpenAI format for the template.
 fn convert_tools(tools: Option<&Value>) -> Option<Value> {
     let arr = tools?.as_array()?;
-    let converted: Vec<Value> = arr.iter().filter_map(|t| {
-        let name = t.get("name")?.as_str()?;
-        let description = t.get("description").and_then(Value::as_str).unwrap_or("");
-        let schema = t.get("input_schema").cloned().unwrap_or(json!({"type": "object"}));
-        Some(json!({
-            "type": "function",
-            "function": {
-                "name": name,
-                "description": description,
-                "parameters": schema
-            }
-        }))
-    }).collect();
-    if converted.is_empty() { None } else { Some(Value::Array(converted)) }
+    let converted: Vec<Value> = arr
+        .iter()
+        .filter_map(|t| {
+            let name = t.get("name")?.as_str()?;
+            let description = t.get("description").and_then(Value::as_str).unwrap_or("");
+            let schema = t
+                .get("input_schema")
+                .cloned()
+                .unwrap_or(json!({"type": "object"}));
+            Some(json!({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": description,
+                    "parameters": schema
+                }
+            }))
+        })
+        .collect();
+    if converted.is_empty() {
+        None
+    } else {
+        Some(Value::Array(converted))
+    }
 }
 
 /// Generate message ID.
 fn gen_id() -> String {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
     format!("msg_{:x}", now)
 }
 
@@ -355,7 +408,10 @@ pub fn handle_stream(
 ) -> std::io::Result<()> {
     let id = gen_id();
 
-    write!(conn, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n")?;
+    write!(
+        conn,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"
+    )?;
 
     let send = |conn: &mut TcpStream, event: &str, data: &Value| -> std::io::Result<()> {
         write!(conn, "event: {event}\ndata: {data}\n\n")?;
@@ -363,19 +419,23 @@ pub fn handle_stream(
     };
 
     // message_start
-    send(&mut conn, "message_start", &json!({
-        "type": "message_start",
-        "message": {
-            "id": id,
-            "type": "message",
-            "role": "assistant",
-            "model": model,
-            "content": [],
-            "stop_reason": Value::Null,
-            "stop_sequence": Value::Null,
-            "usage": {"input_tokens": 0, "output_tokens": 0}
-        }
-    }))?;
+    send(
+        &mut conn,
+        "message_start",
+        &json!({
+            "type": "message_start",
+            "message": {
+                "id": id,
+                "type": "message",
+                "role": "assistant",
+                "model": model,
+                "content": [],
+                "stop_reason": Value::Null,
+                "stop_sequence": Value::Null,
+                "usage": {"input_tokens": 0, "output_tokens": 0}
+            }
+        }),
+    )?;
 
     let mut split = ThinkSplit::new(thinking_enabled);
     let mut tool_parser = ToolCallParser::new();
@@ -393,18 +453,26 @@ pub fn handle_stream(
                 // Emit thinking deltas
                 if !r.is_empty() && thinking_enabled {
                     if !thinking_started {
-                        send(&mut conn, "content_block_start", &json!({
-                            "type": "content_block_start",
-                            "index": block_idx,
-                            "content_block": {"type": "thinking", "thinking": "", "signature": ""}
-                        }))?;
+                        send(
+                            &mut conn,
+                            "content_block_start",
+                            &json!({
+                                "type": "content_block_start",
+                                "index": block_idx,
+                                "content_block": {"type": "thinking", "thinking": "", "signature": ""}
+                            }),
+                        )?;
                         thinking_started = true;
                     }
-                    send(&mut conn, "content_block_delta", &json!({
-                        "type": "content_block_delta",
-                        "index": block_idx,
-                        "delta": {"type": "thinking_delta", "thinking": r}
-                    }))?;
+                    send(
+                        &mut conn,
+                        "content_block_delta",
+                        &json!({
+                            "type": "content_block_delta",
+                            "index": block_idx,
+                            "delta": {"type": "thinking_delta", "thinking": r}
+                        }),
+                    )?;
                 }
 
                 // Parse tool calls
@@ -414,24 +482,36 @@ pub fn handle_stream(
                 if !safe.is_empty() {
                     if !text_started {
                         if thinking_started {
-                            send(&mut conn, "content_block_stop", &json!({
-                                "type": "content_block_stop",
-                                "index": block_idx
-                            }))?;
+                            send(
+                                &mut conn,
+                                "content_block_stop",
+                                &json!({
+                                    "type": "content_block_stop",
+                                    "index": block_idx
+                                }),
+                            )?;
                             block_idx += 1;
                         }
-                        send(&mut conn, "content_block_start", &json!({
-                            "type": "content_block_start",
-                            "index": block_idx,
-                            "content_block": {"type": "text", "text": ""}
-                        }))?;
+                        send(
+                            &mut conn,
+                            "content_block_start",
+                            &json!({
+                                "type": "content_block_start",
+                                "index": block_idx,
+                                "content_block": {"type": "text", "text": ""}
+                            }),
+                        )?;
                         text_started = true;
                     }
-                    send(&mut conn, "content_block_delta", &json!({
-                        "type": "content_block_delta",
-                        "index": block_idx,
-                        "delta": {"type": "text_delta", "text": safe}
-                    }))?;
+                    send(
+                        &mut conn,
+                        "content_block_delta",
+                        &json!({
+                            "type": "content_block_delta",
+                            "index": block_idx,
+                            "delta": {"type": "text_delta", "text": safe}
+                        }),
+                    )?;
                 }
 
                 all_calls.extend(calls);
@@ -440,19 +520,27 @@ pub fn handle_stream(
                 // Flush
                 let (r, c) = split.push("", true);
                 if !r.is_empty() && thinking_enabled && !thinking_started {
-                    send(&mut conn, "content_block_start", &json!({
-                        "type": "content_block_start",
-                        "index": block_idx,
-                        "content_block": {"type": "thinking", "thinking": "", "signature": ""}
-                    }))?;
+                    send(
+                        &mut conn,
+                        "content_block_start",
+                        &json!({
+                            "type": "content_block_start",
+                            "index": block_idx,
+                            "content_block": {"type": "thinking", "thinking": "", "signature": ""}
+                        }),
+                    )?;
                     thinking_started = true;
                 }
                 if !r.is_empty() && thinking_started {
-                    send(&mut conn, "content_block_delta", &json!({
-                        "type": "content_block_delta",
-                        "index": block_idx,
-                        "delta": {"type": "thinking_delta", "thinking": r}
-                    }))?;
+                    send(
+                        &mut conn,
+                        "content_block_delta",
+                        &json!({
+                            "type": "content_block_delta",
+                            "index": block_idx,
+                            "delta": {"type": "thinking_delta", "thinking": r}
+                        }),
+                    )?;
                 }
 
                 let (safe, calls) = tool_parser.push(&c, true);
@@ -461,82 +549,112 @@ pub fn handle_stream(
                 if !safe.is_empty() {
                     if !text_started {
                         if thinking_started {
-                            send(&mut conn, "content_block_stop", &json!({
-                                "type": "content_block_stop",
-                                "index": block_idx
-                            }))?;
+                            send(
+                                &mut conn,
+                                "content_block_stop",
+                                &json!({
+                                    "type": "content_block_stop",
+                                    "index": block_idx
+                                }),
+                            )?;
                             block_idx += 1;
                         }
-                        send(&mut conn, "content_block_start", &json!({
-                            "type": "content_block_start",
-                            "index": block_idx,
-                            "content_block": {"type": "text", "text": ""}
-                        }))?;
+                        send(
+                            &mut conn,
+                            "content_block_start",
+                            &json!({
+                                "type": "content_block_start",
+                                "index": block_idx,
+                                "content_block": {"type": "text", "text": ""}
+                            }),
+                        )?;
                         text_started = true;
                     }
-                    send(&mut conn, "content_block_delta", &json!({
-                        "type": "content_block_delta",
-                        "index": block_idx,
-                        "delta": {"type": "text_delta", "text": safe}
-                    }))?;
+                    send(
+                        &mut conn,
+                        "content_block_delta",
+                        &json!({
+                            "type": "content_block_delta",
+                            "index": block_idx,
+                            "delta": {"type": "text_delta", "text": safe}
+                        }),
+                    )?;
                 }
 
                 // Close text block if open
-                if text_started {
-                    send(&mut conn, "content_block_stop", &json!({
-                        "type": "content_block_stop",
-                        "index": block_idx
-                    }))?;
-                    block_idx += 1;
-                } else if thinking_started {
-                    send(&mut conn, "content_block_stop", &json!({
-                        "type": "content_block_stop",
-                        "index": block_idx
-                    }))?;
+                if text_started || thinking_started {
+                    send(
+                        &mut conn,
+                        "content_block_stop",
+                        &json!({
+                            "type": "content_block_stop",
+                            "index": block_idx
+                        }),
+                    )?;
                     block_idx += 1;
                 }
 
                 // Emit tool_use blocks
                 for call in &all_calls {
-                    send(&mut conn, "content_block_start", &json!({
-                        "type": "content_block_start",
-                        "index": block_idx,
-                        "content_block": {
-                            "type": "tool_use",
-                            "id": call.id,
-                            "name": call.name,
-                            "input": {}
-                        }
-                    }))?;
-                    send(&mut conn, "content_block_delta", &json!({
-                        "type": "content_block_delta",
-                        "index": block_idx,
-                        "delta": {
-                            "type": "input_json_delta",
-                            "partial_json": call.arguments.to_string()
-                        }
-                    }))?;
-                    send(&mut conn, "content_block_stop", &json!({
-                        "type": "content_block_stop",
-                        "index": block_idx
-                    }))?;
+                    send(
+                        &mut conn,
+                        "content_block_start",
+                        &json!({
+                            "type": "content_block_start",
+                            "index": block_idx,
+                            "content_block": {
+                                "type": "tool_use",
+                                "id": call.id,
+                                "name": call.name,
+                                "input": {}
+                            }
+                        }),
+                    )?;
+                    send(
+                        &mut conn,
+                        "content_block_delta",
+                        &json!({
+                            "type": "content_block_delta",
+                            "index": block_idx,
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": call.arguments.to_string()
+                            }
+                        }),
+                    )?;
+                    send(
+                        &mut conn,
+                        "content_block_stop",
+                        &json!({
+                            "type": "content_block_stop",
+                            "index": block_idx
+                        }),
+                    )?;
                     block_idx += 1;
                 }
 
                 // message_delta with stop_reason and usage
-                send(&mut conn, "message_delta", &json!({
-                    "type": "message_delta",
-                    "delta": {
-                        "stop_reason": stop_reason(&d, !all_calls.is_empty()),
-                        "stop_sequence": Value::Null
-                    },
-                    "usage": {"output_tokens": d.completion_tokens}
-                }))?;
+                send(
+                    &mut conn,
+                    "message_delta",
+                    &json!({
+                        "type": "message_delta",
+                        "delta": {
+                            "stop_reason": stop_reason(&d, !all_calls.is_empty()),
+                            "stop_sequence": Value::Null
+                        },
+                        "usage": {"output_tokens": d.completion_tokens}
+                    }),
+                )?;
 
                 // message_stop
-                send(&mut conn, "message_stop", &json!({
-                    "type": "message_stop"
-                }))?;
+                send(
+                    &mut conn,
+                    "message_stop",
+                    &json!({
+                        "type": "message_stop"
+                    }),
+                )?;
             }
         }
     }
@@ -555,10 +673,10 @@ pub fn count_tokens(
     let tools = convert_tools(req.get("tools"));
 
     let mut kwargs = default_kwargs.clone();
-    if let Some(thinking) = req.get("thinking") {
-        if let Some(enabled) = thinking.get("enabled").and_then(Value::as_bool) {
-            kwargs.insert("enable_thinking".into(), Value::Bool(enabled));
-        }
+    if let Some(thinking) = req.get("thinking")
+        && let Some(enabled) = thinking.get("enabled").and_then(Value::as_bool)
+    {
+        kwargs.insert("enable_thinking".into(), Value::Bool(enabled));
     }
 
     let prompt_text = template.render(&messages, tools.as_ref(), &kwargs)?;

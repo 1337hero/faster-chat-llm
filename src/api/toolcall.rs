@@ -20,7 +20,7 @@ use serde_json::{Map, Value, json};
 pub struct ToolCall {
     pub id: String,
     pub name: String,
-    pub arguments: Value,  // object with parameter values
+    pub arguments: Value, // object with parameter values
 }
 
 /// Incrementally parses tool calls from streamed text.
@@ -69,7 +69,11 @@ impl ToolCallParser {
                     continue;
                 }
                 // Hold back a tail that could be the start of <tool_call>
-                let hold = if last { 0 } else { "<tool_call>".len().saturating_sub(1).min(self.buf.len()) };
+                let hold = if last {
+                    0
+                } else {
+                    "<tool_call>".len().saturating_sub(1).min(self.buf.len())
+                };
                 let safe = self.buf.len().saturating_sub(hold);
                 // Ensure we don't split a char
                 let mut safe = safe;
@@ -116,18 +120,22 @@ impl ToolCallParser {
         // Extract parameters
         let mut arguments = Map::new();
         let func_content_start = name_end + 1;
-        let func_end = text.find("</function>").unwrap_or(text.len());
+        let func_end = text[func_content_start..].find("</function>")? + func_content_start;
         let func_body = &text[func_content_start..func_end];
 
         // Parse each <parameter=NAME>VALUE</parameter>
         let mut rest = func_body;
         while let Some(param_start) = rest.find("<parameter=") {
             let after_tag = param_start + "<parameter=".len();
-            let Some(name_end_rel) = rest[after_tag..].find('>') else { break };
+            let Some(name_end_rel) = rest[after_tag..].find('>') else {
+                break;
+            };
             let param_name = rest[after_tag..after_tag + name_end_rel].trim();
 
             let value_start = after_tag + name_end_rel + 1;
-            let Some(end_tag) = rest[value_start..].find("</parameter>") else { break };
+            let Some(end_tag) = rest[value_start..].find("</parameter>") else {
+                break;
+            };
             let value_text = rest[value_start..value_start + end_tag].trim();
 
             // Try parsing as JSON; if that fails, it's a string
@@ -153,29 +161,35 @@ impl ToolCallParser {
 
 /// Format tool calls for OpenAI Chat Completions response.
 pub fn tool_calls_to_openai(calls: &[ToolCall]) -> Value {
-    let arr: Vec<Value> = calls.iter().map(|c| {
-        json!({
-            "id": c.id,
-            "type": "function",
-            "function": {
-                "name": c.name,
-                "arguments": c.arguments.to_string()
-            }
+    let arr: Vec<Value> = calls
+        .iter()
+        .map(|c| {
+            json!({
+                "id": c.id,
+                "type": "function",
+                "function": {
+                    "name": c.name,
+                    "arguments": c.arguments.to_string()
+                }
+            })
         })
-    }).collect();
+        .collect();
     Value::Array(arr)
 }
 
 /// Format tool calls for Anthropic Messages response (tool_use blocks).
 pub fn tool_calls_to_anthropic(calls: &[ToolCall]) -> Vec<Value> {
-    calls.iter().map(|c| {
-        json!({
-            "type": "tool_use",
-            "id": c.id,
-            "name": c.name,
-            "input": c.arguments
+    calls
+        .iter()
+        .map(|c| {
+            json!({
+                "type": "tool_use",
+                "id": c.id,
+                "name": c.name,
+                "input": c.arguments
+            })
         })
-    }).collect()
+        .collect()
 }
 
 // ponytail: tool_calls_to_responses removed - Responses API formats inline, add back if needed
@@ -239,7 +253,10 @@ mod tests {
         assert_eq!(t1, "he");
         assert!(c1.is_empty());
 
-        let (t2, c2) = p.push("call>\n<function=test>\n</function>\n</tool_call>done", true);
+        let (t2, c2) = p.push(
+            "call>\n<function=test>\n</function>\n</tool_call>done",
+            true,
+        );
         // "llo <tool_call>..." completes the tag, so "llo " goes before it and "done" after.
         assert_eq!(t2, "llo done");
         assert_eq!(c2.len(), 1);
@@ -260,13 +277,13 @@ mod tests {
         let input = r#"<tool_call>
 <function=calculate>
 <parameter=x>42</parameter>
-<parameter=y>3.14</parameter>
+<parameter=y>1.25</parameter>
 </function>
 </tool_call>"#;
 
         let (_, calls) = p.push(input, true);
         assert_eq!(calls[0].arguments["x"], 42);
-        assert!(calls[0].arguments["y"].as_f64().unwrap() - 3.14 < 0.001);
+        assert!((calls[0].arguments["y"].as_f64().unwrap() - 1.25).abs() < 0.001);
     }
 
     #[test]

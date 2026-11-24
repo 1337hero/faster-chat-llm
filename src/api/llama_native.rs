@@ -9,8 +9,8 @@ use std::sync::mpsc::Receiver;
 use serde_json::{Map, Value, json};
 
 use crate::chat::ChatTemplate;
-use crate::sched::{Done, Event};
 use crate::sampler::SampleParams;
+use crate::sched::{Done, Event};
 use crate::tokenizer::Tokenizer;
 
 use super::internal::{GenRequest, Thinking, openai_error};
@@ -25,9 +25,12 @@ pub fn parse_completion_request(
     let (prompt_text, prompt_ids) = match req.get("prompt") {
         Some(Value::String(s)) => (s.clone(), None),
         Some(Value::Array(arr)) => {
-            let all_numbers = arr.iter().all(|v| v.is_u64() || v.is_i64());
+            let all_numbers = arr.iter().all(Value::is_number);
             if all_numbers {
-                let ids: Vec<u32> = arr.iter().filter_map(|v| v.as_u64().map(|n| n as u32)).collect();
+                let ids = arr
+                    .iter()
+                    .map(|value| super::internal::parse_token_id(value, tok))
+                    .collect::<Result<Vec<_>, _>>()?;
                 (String::new(), Some(ids))
             } else {
                 // Mixed: concatenate strings and decode tokens
@@ -35,12 +38,11 @@ pub fn parse_completion_request(
                 for item in arr {
                     match item {
                         Value::String(s) => text.push_str(s),
-                        Value::Number(n) => {
-                            if let Some(id) = n.as_u64() {
-                                text.push_str(&tok.decode(&[id as u32]));
-                            }
+                        Value::Number(_) => {
+                            let id = super::internal::parse_token_id(item, tok)?;
+                            text.push_str(&tok.decode(&[id]));
                         }
-                        _ => {}
+                        _ => return Err("prompt entries must be strings or token IDs".into()),
                     }
                 }
                 (text, None)
@@ -70,19 +72,25 @@ pub fn parse_completion_request(
     // Stop sequences
     let stop = match req.get("stop") {
         Some(Value::String(s)) => vec![s.clone()],
-        Some(Value::Array(a)) => a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
+        Some(Value::Array(a)) => a
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
         _ => Vec::new(),
     };
 
     // n_predict maps to max_tokens
     let max_tokens = match i("n_predict") {
-        Some(n) if n > 0 => n as usize,
+        Some(n) if n >= 0 => n as usize,
         Some(-1) | None => usize::MAX,
         _ => usize::MAX,
     };
 
     let stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
-    let return_tokens = req.get("return_tokens").and_then(Value::as_bool).unwrap_or(false);
+    let return_tokens = req
+        .get("return_tokens")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     // cache_prompt is accepted but we always cache
 
     Ok(GenRequest {
@@ -174,7 +182,10 @@ pub fn handle_completion_stream(
     return_tokens: bool,
     _tok: &Tokenizer,
 ) -> std::io::Result<()> {
-    write!(conn, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n")?;
+    write!(
+        conn,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"
+    )?;
 
     let send = |conn: &mut TcpStream, v: &Value| -> std::io::Result<()> {
         write!(conn, "data: {v}\n\n")?;
@@ -200,16 +211,19 @@ pub fn handle_completion_stream(
                     "length" => "limit",
                     _ => "none",
                 };
-                send(&mut conn, &json!({
-                    "content": "",
-                    "stop": true,
-                    "stop_type": stop_type,
-                    "model": model,
-                    "tokens_predicted": d.completion_tokens,
-                    "tokens_evaluated": d.prompt_tokens,
-                    "tokens_cached": d.cached_tokens,
-                    "timings": timings(&d),
-                }))?;
+                send(
+                    &mut conn,
+                    &json!({
+                        "content": "",
+                        "stop": true,
+                        "stop_type": stop_type,
+                        "model": model,
+                        "tokens_predicted": d.completion_tokens,
+                        "tokens_evaluated": d.prompt_tokens,
+                        "tokens_cached": d.cached_tokens,
+                        "timings": timings(&d),
+                    }),
+                )?;
             }
         }
     }
@@ -220,21 +234,30 @@ pub fn handle_completion_stream(
 /// Handle /tokenize endpoint.
 pub fn tokenize(req: &Value, tok: &Tokenizer) -> Value {
     let content = req.get("content").and_then(Value::as_str).unwrap_or("");
-    let add_special = req.get("add_special").and_then(Value::as_bool).unwrap_or(false);
-    let with_pieces = req.get("with_pieces").and_then(Value::as_bool).unwrap_or(false);
+    let add_special = req
+        .get("add_special")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let with_pieces = req
+        .get("with_pieces")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     // parse_special is accepted but we always parse specials
 
     let tokens = tok.encode(content, add_special);
 
     if with_pieces {
-        let pieces: Vec<Value> = tokens.iter().map(|&id| {
-            let bytes = tok.decode_id(id);
-            let piece = match std::str::from_utf8(bytes) {
-                Ok(s) => Value::String(s.to_string()),
-                Err(_) => Value::Array(bytes.iter().map(|&b| json!(b)).collect()),
-            };
-            json!({"id": id, "piece": piece})
-        }).collect();
+        let pieces: Vec<Value> = tokens
+            .iter()
+            .map(|&id| {
+                let bytes = tok.decode_id(id);
+                let piece = match std::str::from_utf8(bytes) {
+                    Ok(s) => Value::String(s.to_string()),
+                    Err(_) => Value::Array(bytes.iter().map(|&b| json!(b)).collect()),
+                };
+                json!({"id": id, "piece": piece})
+            })
+            .collect();
         json!({"tokens": pieces})
     } else {
         json!({"tokens": tokens})
@@ -243,9 +266,14 @@ pub fn tokenize(req: &Value, tok: &Tokenizer) -> Value {
 
 /// Handle /detokenize endpoint.
 pub fn detokenize(req: &Value, tok: &Tokenizer) -> Value {
-    let tokens: Vec<u32> = req.get("tokens")
+    let tokens: Vec<u32> = req
+        .get("tokens")
         .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u32)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_u64().map(|n| n as u32))
+                .collect()
+        })
         .unwrap_or_default();
 
     let content = tok.decode(&tokens);
@@ -286,13 +314,15 @@ pub fn props(model: &str, defaults: &SampleParams, n_slots: usize, ctx_size: usi
 pub fn slots(n_slots: usize) -> Value {
     // ponytail: real implementation would need driver cooperation to report slot state
     // This stub returns all slots as idle
-    let slots: Vec<Value> = (0..n_slots).map(|i| {
-        json!({
-            "id": i,
-            "is_processing": false,
-            "n_ctx": 0,
+    let slots: Vec<Value> = (0..n_slots)
+        .map(|i| {
+            json!({
+                "id": i,
+                "is_processing": false,
+                "n_ctx": 0,
+            })
         })
-    }).collect();
+        .collect();
     Value::Array(slots)
 }
 

@@ -9,13 +9,13 @@ use std::sync::mpsc::Receiver;
 use serde_json::{Map, Value, json};
 
 use crate::chat::ChatTemplate;
-use crate::sched::{Done, Event};
 use crate::sampler::SampleParams;
+use crate::sched::{Done, Event};
 use crate::tokenizer::Tokenizer;
 
 use super::internal::{GenRequest, Thinking, extract_sampling, merge_kwargs, openai_error};
 use super::openai_chat::ThinkSplit;
-use super::toolcall::{ToolCallParser, ToolCall};
+use super::toolcall::{ToolCall, ToolCallParser};
 
 /// Parse a responses request into a GenRequest.
 pub fn parse_request(
@@ -42,17 +42,24 @@ pub fn parse_request(
     let kwargs = merge_kwargs(default_kwargs, req.get("chat_template_kwargs"));
 
     let prompt_text = template.render(&messages, tools.as_ref(), &kwargs)?;
-    let thinking = kwargs.get("enable_thinking").and_then(Value::as_bool).unwrap_or(true);
+    let thinking = kwargs
+        .get("enable_thinking")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
 
     let sampling = extract_sampling(req, defaults);
 
     // Extract stop from stop_sequences (Responses API name)
     let stop = match req.get("stop_sequences") {
-        Some(Value::Array(a)) => a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
+        Some(Value::Array(a)) => a
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
         _ => Vec::new(),
     };
 
-    let max_tokens = req.get("max_output_tokens")
+    let max_tokens = req
+        .get("max_output_tokens")
         .and_then(Value::as_u64)
         .map_or(usize::MAX, |v| v as usize);
     let stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
@@ -63,7 +70,11 @@ pub fn parse_request(
         max_tokens,
         sampling,
         stop,
-        thinking: if thinking { Thinking::Enabled } else { Thinking::Disabled },
+        thinking: if thinking {
+            Thinking::Enabled
+        } else {
+            Thinking::Disabled
+        },
         stream,
         stream_include_usage: false,
         echo: false,
@@ -97,7 +108,10 @@ fn convert_input_to_messages(req: &Value) -> Result<Value, String> {
                         // Assistant made a function call
                         let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or("");
                         let name = item.get("name").and_then(Value::as_str).unwrap_or("");
-                        let args = item.get("arguments").and_then(Value::as_str).unwrap_or("{}");
+                        let args = item
+                            .get("arguments")
+                            .and_then(Value::as_str)
+                            .unwrap_or("{}");
                         messages.push(json!({
                             "role": "assistant",
                             "tool_calls": [{
@@ -148,7 +162,9 @@ fn convert_message_content(item: &Value) -> Result<Value, String> {
                             }
                         }
                         Some("input_image") => {
-                            return Err("image input is not supported; this model is text-only".into());
+                            return Err(
+                                "image input is not supported; this model is text-only".into()
+                            );
                         }
                         _ => {}
                     }
@@ -164,25 +180,37 @@ fn convert_message_content(item: &Value) -> Result<Value, String> {
 /// Convert flat function tools to OpenAI format.
 fn convert_tools(tools: Option<&Value>) -> Option<Value> {
     let arr = tools?.as_array()?;
-    let converted: Vec<Value> = arr.iter().filter_map(|t| {
-        let name = t.get("name")?.as_str()?;
-        let description = t.get("description").and_then(Value::as_str).unwrap_or("");
-        let parameters = t.get("parameters").cloned().unwrap_or(json!({"type": "object"}));
-        Some(json!({
-            "type": "function",
-            "function": {
-                "name": name,
-                "description": description,
-                "parameters": parameters
-            }
-        }))
-    }).collect();
-    if converted.is_empty() { None } else { Some(Value::Array(converted)) }
+    let converted: Vec<Value> = arr
+        .iter()
+        .filter_map(|t| {
+            let name = t.get("name")?.as_str()?;
+            let description = t.get("description").and_then(Value::as_str).unwrap_or("");
+            let parameters = t
+                .get("parameters")
+                .cloned()
+                .unwrap_or(json!({"type": "object"}));
+            Some(json!({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": description,
+                    "parameters": parameters
+                }
+            }))
+        })
+        .collect();
+    if converted.is_empty() {
+        None
+    } else {
+        Some(Value::Array(converted))
+    }
 }
 
 /// Generate response ID.
 fn gen_id() -> String {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
     format!("resp_{:x}", now)
 }
 
@@ -228,11 +256,18 @@ fn response_object(id: &str, model: &str, status: &str, output: Vec<Value>, usag
 }
 
 fn created_at() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// Handle non-streaming response.
-pub fn handle_sync(rx: Receiver<Event>, model: &str, thinking_enabled: bool, _has_tools: bool) -> Value {
+pub fn handle_sync(
+    rx: Receiver<Event>,
+    model: &str,
+    thinking_enabled: bool,
+    _has_tools: bool,
+) -> Value {
     let id = gen_id();
     let mut split = ThinkSplit::new(thinking_enabled);
     let mut tool_parser = ToolCallParser::new();
@@ -258,15 +293,30 @@ pub fn handle_sync(rx: Receiver<Event>, model: &str, thinking_enabled: bool, _ha
     let Some(d) = done_info else {
         return openai_error("engine stopped", "server_error", None);
     };
-    response_object(&id, model, "completed", output_items(&reasoning, &content, &calls), usage(&d))
+    response_object(
+        &id,
+        model,
+        "completed",
+        output_items(&reasoning, &content, &calls),
+        usage(&d),
+    )
 }
 
 /// Handle streaming response with semantic events. Text streams as it arrives; reasoning and
 /// tool calls are announced as whole items once known.
 #[allow(unused_assignments)] // the macro's last expansion sets a flag nothing reads afterwards
-pub fn handle_stream(mut conn: TcpStream, rx: Receiver<Event>, model: &str, thinking_enabled: bool, _has_tools: bool) -> std::io::Result<()> {
+pub fn handle_stream(
+    mut conn: TcpStream,
+    rx: Receiver<Event>,
+    model: &str,
+    thinking_enabled: bool,
+    _has_tools: bool,
+) -> std::io::Result<()> {
     let id = gen_id();
-    write!(conn, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n")?;
+    write!(
+        conn,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"
+    )?;
 
     let mut seq = 0u64;
     let mut send = |conn: &mut TcpStream, event: &str, mut data: Value| -> std::io::Result<()> {
@@ -279,11 +329,16 @@ pub fn handle_stream(mut conn: TcpStream, rx: Receiver<Event>, model: &str, thin
 
     let skeleton = response_object(&id, model, "in_progress", Vec::new(), Value::Null);
     send(&mut conn, "response.created", json!({"response": skeleton}))?;
-    send(&mut conn, "response.in_progress", json!({"response": skeleton}))?;
+    send(
+        &mut conn,
+        "response.in_progress",
+        json!({"response": skeleton}),
+    )?;
 
     let mut split = ThinkSplit::new(thinking_enabled);
     let mut tool_parser = ToolCallParser::new();
-    let (mut reasoning, mut content, mut calls) = (String::new(), String::new(), Vec::<ToolCall>::new());
+    let (mut reasoning, mut content, mut calls) =
+        (String::new(), String::new(), Vec::<ToolCall>::new());
     // Output index of the message item once its first text has been sent.
     let mut message_at: Option<usize> = None;
     let mut next_index = 0usize;
@@ -349,8 +404,16 @@ pub fn handle_stream(mut conn: TcpStream, rx: Receiver<Event>, model: &str, thin
         let at = next_index;
         next_index += 1;
         message_at = Some(at);
-        send(&mut conn, "response.output_item.added", json!({"output_index": at, "item": {"type": "message", "id": format!("msg_{at}"), "role": "assistant", "status": "in_progress", "content": []}}))?;
-        send(&mut conn, "response.content_part.added", json!({"item_id": format!("msg_{at}"), "output_index": at, "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": []}}))?;
+        send(
+            &mut conn,
+            "response.output_item.added",
+            json!({"output_index": at, "item": {"type": "message", "id": format!("msg_{at}"), "role": "assistant", "status": "in_progress", "content": []}}),
+        )?;
+        send(
+            &mut conn,
+            "response.content_part.added",
+            json!({"item_id": format!("msg_{at}"), "output_index": at, "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": []}}),
+        )?;
     }
     let mut output = Vec::new();
     if !reasoning.is_empty() {
@@ -359,9 +422,21 @@ pub fn handle_stream(mut conn: TcpStream, rx: Receiver<Event>, model: &str, thin
     if let Some(at) = message_at {
         let part = json!({"type": "output_text", "text": content, "annotations": []});
         let item = json!({"type": "message", "id": format!("msg_{at}"), "role": "assistant", "status": "completed", "content": [part]});
-        send(&mut conn, "response.output_text.done", json!({"item_id": format!("msg_{at}"), "output_index": at, "content_index": 0, "text": content, "logprobs": []}))?;
-        send(&mut conn, "response.content_part.done", json!({"item_id": format!("msg_{at}"), "output_index": at, "content_index": 0, "part": part}))?;
-        send(&mut conn, "response.output_item.done", json!({"output_index": at, "item": item}))?;
+        send(
+            &mut conn,
+            "response.output_text.done",
+            json!({"item_id": format!("msg_{at}"), "output_index": at, "content_index": 0, "text": content, "logprobs": []}),
+        )?;
+        send(
+            &mut conn,
+            "response.content_part.done",
+            json!({"item_id": format!("msg_{at}"), "output_index": at, "content_index": 0, "part": part}),
+        )?;
+        send(
+            &mut conn,
+            "response.output_item.done",
+            json!({"output_index": at, "item": item}),
+        )?;
         output.push(item);
     }
     for call in &calls {
@@ -369,13 +444,32 @@ pub fn handle_stream(mut conn: TcpStream, rx: Receiver<Event>, model: &str, thin
         next_index += 1;
         let args = call.arguments.to_string();
         let item = json!({"type": "function_call", "id": format!("fc_{at}"), "status": "completed", "call_id": call.id, "name": call.name, "arguments": args});
-        send(&mut conn, "response.output_item.added", json!({"output_index": at, "item": {"type": "function_call", "id": format!("fc_{at}"), "status": "in_progress", "call_id": call.id, "name": call.name, "arguments": ""}}))?;
-        send(&mut conn, "response.function_call_arguments.delta", json!({"item_id": format!("fc_{at}"), "output_index": at, "delta": args}))?;
-        send(&mut conn, "response.function_call_arguments.done", json!({"item_id": format!("fc_{at}"), "output_index": at, "name": call.name, "arguments": args}))?;
-        send(&mut conn, "response.output_item.done", json!({"output_index": at, "item": item}))?;
+        send(
+            &mut conn,
+            "response.output_item.added",
+            json!({"output_index": at, "item": {"type": "function_call", "id": format!("fc_{at}"), "status": "in_progress", "call_id": call.id, "name": call.name, "arguments": ""}}),
+        )?;
+        send(
+            &mut conn,
+            "response.function_call_arguments.delta",
+            json!({"item_id": format!("fc_{at}"), "output_index": at, "delta": args}),
+        )?;
+        send(
+            &mut conn,
+            "response.function_call_arguments.done",
+            json!({"item_id": format!("fc_{at}"), "output_index": at, "name": call.name, "arguments": args}),
+        )?;
+        send(
+            &mut conn,
+            "response.output_item.done",
+            json!({"output_index": at, "item": item}),
+        )?;
         output.push(item);
     }
-    send(&mut conn, "response.completed", json!({"response": response_object(&id, model, "completed", output, usage(&d))}))?;
+    send(
+        &mut conn,
+        "response.completed",
+        json!({"response": response_object(&id, model, "completed", output, usage(&d))}),
+    )?;
     Ok(())
 }
-

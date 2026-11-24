@@ -1,7 +1,15 @@
 //! Internal request type that all API adapters translate to.
 
-use serde_json::{Map, Value};
 use crate::sampler::SampleParams;
+use crate::tokenizer::Tokenizer;
+use serde_json::{Map, Value};
+
+pub fn parse_token_id(value: &Value, tok: &Tokenizer) -> Result<u32, String> {
+    let value = value
+        .as_u64()
+        .ok_or("token IDs must be nonnegative integers")?;
+    tok.validate_id(value)
+}
 
 /// Thinking/reasoning mode configuration.
 #[derive(Clone, Copy, Debug)]
@@ -90,7 +98,10 @@ pub fn extract_sampling(req: &Value, defaults: &SampleParams) -> SampleParams {
 pub fn extract_stop(req: &Value) -> Vec<String> {
     match req.get("stop") {
         Some(Value::String(s)) => vec![s.clone()],
-        Some(Value::Array(a)) => a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
+        Some(Value::Array(a)) => a
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
         _ => Vec::new(),
     }
 }

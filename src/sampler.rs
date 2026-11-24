@@ -34,8 +34,17 @@ impl Rng {
 }
 
 pub fn sample(logits: &[f32], p: &SampleParams, rng: &mut Rng) -> u32 {
-    let k = if p.top_k == 0 { logits.len() } else { p.top_k.min(logits.len()) };
-    let mut cand: Vec<(u32, f32)> = logits.iter().copied().enumerate().map(|(i, v)| (i as u32, v)).collect();
+    let k = if p.top_k == 0 {
+        logits.len()
+    } else {
+        p.top_k.min(logits.len())
+    };
+    let mut cand: Vec<(u32, f32)> = logits
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(i, v)| (i as u32, v))
+        .collect();
     if k < cand.len() {
         cand.select_nth_unstable_by(k - 1, |a, b| b.1.total_cmp(&a.1));
         cand.truncate(k);
@@ -44,7 +53,10 @@ pub fn sample(logits: &[f32], p: &SampleParams, rng: &mut Rng) -> u32 {
 
     let softmax = |c: &[(u32, f32)], t: f32| -> Vec<f64> {
         let max = c[0].1 as f64;
-        let w: Vec<f64> = c.iter().map(|&(_, v)| ((v as f64 - max) / t as f64).exp()).collect();
+        let w: Vec<f64> = c
+            .iter()
+            .map(|&(_, v)| ((v as f64 - max) / t as f64).exp())
+            .collect();
         let s: f64 = w.iter().sum();
         w.into_iter().map(|x| x / s).collect()
     };

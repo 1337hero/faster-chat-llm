@@ -81,7 +81,14 @@ pub struct Driver {
 impl Driver {
     pub fn new(eng: Engine, tok: Tokenizer, n_slots: usize, cfg: Config) -> Self {
         let stop_ids = vec![tok.eos, tok.bos];
-        Self { eng, tok, slots: (0..n_slots).map(|_| Slot::default()).collect(), cfg, stop_ids, prefill_turn: false }
+        Self {
+            eng,
+            tok,
+            slots: (0..n_slots).map(|_| Slot::default()).collect(),
+            cfg,
+            stop_ids,
+            prefill_turn: false,
+        }
     }
 
     pub fn run(mut self, rx: Receiver<Job>) {
@@ -112,10 +119,32 @@ impl Driver {
     /// The KV pool is shared, so other idle slots give up their cached prefix if the prompt
     /// would not fit otherwise.
     fn admit(&mut self, job: Job) {
-        let reusable = |s: &Slot| s.cached.len() < job.prompt.len() && job.prompt.starts_with(&s.cached);
-        let idle = || self.slots.iter().enumerate().filter(|(_, s)| s.active.is_none());
+        if job.max_tokens == 0 {
+            let _ = job.tx.send(Event::Done(Done {
+                finish_reason: "length",
+                prompt_tokens: job.prompt.len(),
+                cached_tokens: 0,
+                completion_tokens: 0,
+                prefill_s: 0.0,
+                decode_s: 0.0,
+                drafted: 0,
+                accepted: 0,
+            }));
+            return;
+        }
+        let reusable =
+            |s: &Slot| s.cached.len() < job.prompt.len() && job.prompt.starts_with(&s.cached);
+        let idle = || {
+            self.slots
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.active.is_none())
+        };
         // Longest reusable prefix first; otherwise evict the idle slot holding the least.
-        let pick = idle().filter(|(_, s)| reusable(s)).max_by_key(|(_, s)| s.cached.len()).or_else(|| idle().min_by_key(|(_, s)| s.cached.len()));
+        let pick = idle()
+            .filter(|(_, s)| reusable(s))
+            .max_by_key(|(_, s)| s.cached.len())
+            .or_else(|| idle().min_by_key(|(_, s)| s.cached.len()));
         let (i, slot) = pick.expect("admit called without an idle slot");
         let keep = if reusable(slot) { slot.cached.len() } else { 0 };
         if keep == 0 {
@@ -125,23 +154,67 @@ impl Driver {
         // The prompt (beyond what the slot already holds) and one generated row must fit.
         let need = job.prompt.len() - keep + 1;
         if job.prompt.is_empty() || self.make_room(need, Some(i)) < need {
-            let _ = job.tx.send(Event::Done(Done { finish_reason: "length", prompt_tokens: job.prompt.len(), cached_tokens: 0, completion_tokens: 0, prefill_s: 0.0, decode_s: 0.0, drafted: 0, accepted: 0 }));
+            let _ = job.tx.send(Event::Done(Done {
+                finish_reason: "length",
+                prompt_tokens: job.prompt.len(),
+                cached_tokens: 0,
+                completion_tokens: 0,
+                prefill_s: 0.0,
+                decode_s: 0.0,
+                drafted: 0,
+                accepted: 0,
+            }));
             return;
         }
         let rng = Rng::new(job.sampling.seed);
-        self.slots[i].active = Some(Active { job, fed: keep, cached_tokens: keep, last: None, n_gen: 0, rng, pending: Vec::new(), text: String::new(), sent: 0, t0: Instant::now(), t_first: None, drafted: 0, accepted: 0 });
+        self.slots[i].active = Some(Active {
+            job,
+            fed: keep,
+            cached_tokens: keep,
+            last: None,
+            n_gen: 0,
+            rng,
+            pending: Vec::new(),
+            text: String::new(),
+            sent: 0,
+            t0: Instant::now(),
+            t_first: None,
+            drafted: 0,
+            accepted: 0,
+        });
     }
 
     /// One engine step: a prefill chunk for one slot, or a decode step for all decoding slots.
     fn tick(&mut self) {
-        let prefilling: Vec<usize> = (0..self.slots.len()).filter(|&i| self.slots[i].active.as_ref().is_some_and(|a| a.last.is_none())).collect();
-        let decoding: Vec<usize> = (0..self.slots.len()).filter(|&i| self.slots[i].active.as_ref().is_some_and(|a| a.last.is_some())).collect();
+        let prefilling: Vec<usize> = (0..self.slots.len())
+            .filter(|&i| {
+                self.slots[i]
+                    .active
+                    .as_ref()
+                    .is_some_and(|a| a.last.is_none())
+            })
+            .collect();
+        let decoding: Vec<usize> = (0..self.slots.len())
+            .filter(|&i| {
+                self.slots[i]
+                    .active
+                    .as_ref()
+                    .is_some_and(|a| a.last.is_some())
+            })
+            .collect();
         // Alternate so a long prefill cannot starve the other slot's decode.
         let do_prefill = !prefilling.is_empty() && (decoding.is_empty() || self.prefill_turn);
         self.prefill_turn = !self.prefill_turn;
         if do_prefill {
             // Beside a decoding slot, prefill in short steps: each one stalls the decoder.
-            self.prefill(prefilling[0], if decoding.is_empty() { self.cfg.chunk } else { self.cfg.chunk.min(SHARED_CHUNK) });
+            self.prefill(
+                prefilling[0],
+                if decoding.is_empty() {
+                    self.cfg.chunk
+                } else {
+                    self.cfg.chunk.min(SHARED_CHUNK)
+                },
+            );
         } else if !decoding.is_empty() {
             self.decode(&decoding);
         }
@@ -164,7 +237,11 @@ impl Driver {
         if a.fed == a.job.prompt.len() {
             // The engine scores every row of a small batch but only the last row of a large one.
             let row = out.len() - 1;
-            let tok = if a.job.sampling.greedy() { out[row].token } else { sample(&self.eng.logits(row), &a.job.sampling, &mut a.rng) };
+            let tok = if a.job.sampling.greedy() {
+                out[row].token
+            } else {
+                sample(&self.eng.logits(row), &a.job.sampling, &mut a.rng)
+            };
             a.t_first = Some(Instant::now());
             self.emit(i, &[tok], 0);
         }
@@ -182,10 +259,25 @@ impl Driver {
             return;
         }
         let n_draft = n_draft.min(room / slots.len() - 1);
-        let lasts: Vec<(usize, u32)> = slots.iter().map(|&i| (i, self.slots[i].active.as_ref().unwrap().last.unwrap())).collect();
-        let drafts = if n_draft > 0 { self.eng.draft(&lasts, n_draft) } else { vec![Vec::new(); slots.len()] };
-        let rows: Vec<Vec<u32>> = lasts.iter().zip(&drafts).map(|(&(_, last), d)| std::iter::once(last).chain(d.iter().copied()).collect()).collect();
-        let groups: Vec<(usize, &[u32], bool)> = slots.iter().zip(&rows).map(|(&i, r)| (i, r.as_slice(), false)).collect();
+        let lasts: Vec<(usize, u32)> = slots
+            .iter()
+            .map(|&i| (i, self.slots[i].active.as_ref().unwrap().last.unwrap()))
+            .collect();
+        let drafts = if n_draft > 0 {
+            self.eng.draft(&lasts, n_draft)
+        } else {
+            vec![Vec::new(); slots.len()]
+        };
+        let rows: Vec<Vec<u32>> = lasts
+            .iter()
+            .zip(&drafts)
+            .map(|(&(_, last), d)| std::iter::once(last).chain(d.iter().copied()).collect())
+            .collect();
+        let groups: Vec<(usize, &[u32], bool)> = slots
+            .iter()
+            .zip(&rows)
+            .map(|(&i, r)| (i, r.as_slice(), false))
+            .collect();
         let out = self.eng.step(&groups);
 
         let mut row0 = 0;
@@ -195,7 +287,11 @@ impl Driver {
             // survives only if it equals that choice, so the output never depends on the drafter.
             let mut toks = Vec::new();
             for j in 0..r.len() {
-                let t = if a.job.sampling.greedy() { out[row0 + j].token } else { sample(&self.eng.logits(row0 + j), &a.job.sampling, &mut a.rng) };
+                let t = if a.job.sampling.greedy() {
+                    out[row0 + j].token
+                } else {
+                    sample(&self.eng.logits(row0 + j), &a.job.sampling, &mut a.rng)
+                };
                 toks.push(t);
                 if j >= d.len() || d[j] != t {
                     break;
@@ -247,22 +343,38 @@ impl Driver {
             Ok(s) => s.len(),
             Err(e) => e.valid_up_to() + e.error_len().unwrap_or(0),
         };
-        a.text.push_str(&String::from_utf8_lossy(&a.pending[..valid]));
+        a.text
+            .push_str(&String::from_utf8_lossy(&a.pending[..valid]));
         a.pending.drain(..valid);
 
         let mut ok = true;
         // Unsent text always covers the last `hold` bytes, so a stop string can only start there.
         let hold = a.job.stop.iter().map(|s| s.len()).max().unwrap_or(0);
-        if let Some(pos) = a.job.stop.iter().filter_map(|s| a.text[a.sent..].find(s.as_str())).min() {
+        if let Some(pos) = a
+            .job
+            .stop
+            .iter()
+            .filter_map(|s| a.text[a.sent..].find(s.as_str()))
+            .min()
+        {
             a.text.truncate(a.sent + pos);
+            a.pending.clear();
             finish = Some("stop");
         }
-        let mut upto = if finish.is_some() { a.text.len() } else { a.text.len().saturating_sub(hold).max(a.sent) };
+        let mut upto = if finish.is_some() {
+            a.text.len()
+        } else {
+            a.text.len().saturating_sub(hold).max(a.sent)
+        };
         while !a.text.is_char_boundary(upto) {
             upto -= 1;
         }
         if upto > a.sent {
-            ok = a.job.tx.send(Event::Text(a.text[a.sent..upto].to_string())).is_ok();
+            ok = a
+                .job
+                .tx
+                .send(Event::Text(a.text[a.sent..upto].to_string()))
+                .is_ok();
             a.sent = upto;
         }
         if finish.is_some() || !ok {
@@ -273,7 +385,15 @@ impl Driver {
 
     /// End slot `i`'s request and report its totals. The slot keeps its cached state.
     fn finish(&mut self, i: usize, reason: &'static str) {
-        let Some(a) = self.slots[i].active.take() else { return };
+        let Some(mut a) = self.slots[i].active.take() else {
+            return;
+        };
+        if reason != "abort" {
+            a.text.push_str(&String::from_utf8_lossy(&a.pending));
+            if a.sent < a.text.len() {
+                let _ = a.job.tx.send(Event::Text(a.text[a.sent..].to_owned()));
+            }
+        }
         let t_first = a.t_first.unwrap_or_else(Instant::now);
         let _ = a.job.tx.send(Event::Done(Done {
             finish_reason: reason,
@@ -296,8 +416,14 @@ impl Driver {
     /// (largest first, never `keep`). Returns what is free afterwards.
     fn make_room(&mut self, rows: usize, keep: Option<usize>) -> usize {
         while self.free() < rows {
-            let idle = (0..self.slots.len()).filter(|&j| Some(j) != keep && self.slots[j].active.is_none() && !self.slots[j].cached.is_empty());
-            let Some(j) = idle.max_by_key(|&j| self.slots[j].cached.len()) else { break };
+            let idle = (0..self.slots.len()).filter(|&j| {
+                Some(j) != keep
+                    && self.slots[j].active.is_none()
+                    && !self.slots[j].cached.is_empty()
+            });
+            let Some(j) = idle.max_by_key(|&j| self.slots[j].cached.len()) else {
+                break;
+            };
             self.eng.reset(j);
             self.slots[j].cached.clear();
         }

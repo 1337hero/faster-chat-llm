@@ -8,8 +8,8 @@ use std::sync::mpsc::Receiver;
 
 use serde_json::{Value, json};
 
-use crate::sched::{Done, Event};
 use crate::sampler::SampleParams;
+use crate::sched::{Done, Event};
 use crate::tokenizer::Tokenizer;
 
 use super::internal::{GenRequest, Thinking, extract_sampling, extract_stop, openai_error};
@@ -17,27 +17,38 @@ use super::internal::{GenRequest, Thinking, extract_sampling, extract_stop, open
 /// Parse a completions request into a GenRequest.
 pub fn parse_request(
     req: &Value,
-    _tok: &Tokenizer,
+    tok: &Tokenizer,
     defaults: &SampleParams,
 ) -> Result<GenRequest, String> {
     // Validate n parameter
-    if let Some(n) = req.get("n").and_then(Value::as_u64) {
-        if n > 1 {
-            return Err("n > 1 is not supported; this model serves one completion per request".into());
-        }
+    if let Some(n) = req.get("n").and_then(Value::as_u64)
+        && n > 1
+    {
+        return Err("n > 1 is not supported; this model serves one completion per request".into());
     }
 
     let (prompt_text, prompt_ids) = match req.get("prompt") {
         Some(Value::String(s)) => (s.clone(), None),
         Some(Value::Array(arr)) => {
             // Check if it's an array of token IDs (all numbers)
-            let all_numbers = arr.iter().all(|v| v.is_u64() || v.is_i64());
+            let all_numbers = arr.iter().all(Value::is_number);
             if all_numbers {
-                let ids: Vec<u32> = arr.iter().filter_map(|v| v.as_u64().map(|n| n as u32)).collect();
+                let ids = arr
+                    .iter()
+                    .map(|value| super::internal::parse_token_id(value, tok))
+                    .collect::<Result<Vec<_>, _>>()?;
                 (String::new(), Some(ids))
             } else {
                 // Array of strings - concatenate
-                let text: String = arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join("");
+                let text = arr
+                    .iter()
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .ok_or("prompt must contain only strings or only token IDs")
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+                    .join("");
                 (text, None)
             }
         }
@@ -46,7 +57,8 @@ pub fn parse_request(
 
     let sampling = extract_sampling(req, defaults);
     let stop = extract_stop(req);
-    let max_tokens = req.get("max_tokens")
+    let max_tokens = req
+        .get("max_tokens")
         .and_then(Value::as_u64)
         .map_or(16, |v| v as usize); // Default 16 for completions
     let stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
@@ -69,7 +81,9 @@ pub fn parse_request(
 
 /// Generate response ID and timestamp.
 fn gen_ids() -> (String, u64) {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
     let id = format!("cmpl-{:x}", now);
     let created = (now / 1_000_000_000) as u64;
     (id, created)
@@ -134,7 +148,10 @@ pub fn handle_stream(
 ) -> std::io::Result<()> {
     let (id, created) = gen_ids();
 
-    write!(conn, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n")?;
+    write!(
+        conn,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"
+    )?;
 
     let chunk = |text: &str, finish: Value| -> Value {
         json!({

@@ -13,7 +13,11 @@ fn main() {
     let obj = out.join("kernels.o");
     let status = Command::new(format!("{rocm}/bin/hipcc"))
         .args(["-O3", "-std=c++17", "--offload-arch=gfx1201", "-fPIC"])
-        .args(std::env::var("FCL_KERNEL_FLAGS").unwrap_or_default().split_whitespace())
+        .args(
+            std::env::var("FCL_KERNEL_FLAGS")
+                .unwrap_or_default()
+                .split_whitespace(),
+        )
         .args(["-c", src, "-o"])
         .arg(&obj)
         .status()
@@ -22,7 +26,12 @@ fn main() {
 
     let lib = out.join("libfcl_kernels.a");
     let _ = std::fs::remove_file(&lib);
-    let status = Command::new("ar").arg("rcs").arg(&lib).arg(&obj).status().expect("run ar");
+    let status = Command::new("ar")
+        .arg("rcs")
+        .arg(&lib)
+        .arg(&obj)
+        .status()
+        .expect("run ar");
     assert!(status.success(), "ar failed");
 
     println!("cargo:rustc-link-search=native={}", out.display());

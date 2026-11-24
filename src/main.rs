@@ -70,7 +70,10 @@ fn main() -> ExitCode {
         "dump" => dump_tsv(&gguf),
         "encode" => match args.get(3).map(|s| s.as_str()) {
             // "-" reads the text from stdin (arguments are capped at 128 KiB)
-            Some("-") => encode_cmd(&gguf, &std::io::read_to_string(std::io::stdin()).unwrap_or_default()),
+            Some("-") => encode_cmd(
+                &gguf,
+                &std::io::read_to_string(std::io::stdin()).unwrap_or_default(),
+            ),
             other => encode_cmd(&gguf, other.unwrap_or("")),
         },
         "tokcheck" => match args.get(3) {
@@ -109,8 +112,14 @@ fn inspect(g: &Gguf) -> ExitCode {
     println!("data offset     {}", g.data_offset);
     println!("metadata keys   {}", g.meta.len());
     println!("tensors         {}", g.tensors().len());
-    println!("arch            {}", g.str_of("general.architecture").unwrap_or("?"));
-    println!("name            {}", g.str_of("general.name").unwrap_or("?"));
+    println!(
+        "arch            {}",
+        g.str_of("general.architecture").unwrap_or("?")
+    );
+    println!(
+        "name            {}",
+        g.str_of("general.name").unwrap_or("?")
+    );
 
     let mut by_type: BTreeMap<String, (u64, u64)> = BTreeMap::new();
     for t in g.tensors() {
@@ -158,18 +167,18 @@ fn inspect(g: &Gguf) -> ExitCode {
 
 fn dump_meta(g: &Gguf, prefix: Option<&str>) -> ExitCode {
     for (k, v) in &g.meta {
-        if let Some(p) = prefix {
-            if !k.starts_with(p) {
-                continue;
-            }
+        if let Some(p) = prefix
+            && !k.starts_with(p)
+        {
+            continue;
         }
         print!("{k:<52} {:<8}", v.kind());
-        if let gguf::types::MetaValue::String(s) = v {
-            if s.len() > 200 || s.contains('\n') {
-                println!(" {} chars, first line:", s.len());
-                println!("    {}", s.lines().next().unwrap_or(""));
-                continue;
-            }
+        if let gguf::types::MetaValue::String(s) = v
+            && (s.len() > 200 || s.contains('\n'))
+        {
+            println!(" {} chars, first line:", s.len());
+            println!("    {}", s.lines().next().unwrap_or(""));
+            continue;
         }
         println!(" {v}");
     }
@@ -249,8 +258,18 @@ fn encode_cmd(g: &Gguf, text: &str) -> ExitCode {
         }
     };
     let ids = tok.encode(text, true);
-    println!("{}", ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(","));
-    println!("# vocab {} decoded {:?}", tok.vocab_size(), tok.decode(&ids));
+    println!(
+        "{}",
+        ids.iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    println!(
+        "# vocab {} decoded {:?}",
+        tok.vocab_size(),
+        tok.decode(&ids)
+    );
     ExitCode::SUCCESS
 }
 
@@ -284,7 +303,11 @@ fn tokcheck(g: &Gguf, path: &str) -> ExitCode {
                 continue;
             }
         };
-        let ids_part = match line.split("\"ids\": [").nth(1).and_then(|s| s.split(']').next()) {
+        let ids_part = match line
+            .split("\"ids\": [")
+            .nth(1)
+            .and_then(|s| s.split(']').next())
+        {
             Some(s) => s,
             None => {
                 failures.push(format!("line {}: no ids field", lineno + 1));
@@ -354,10 +377,10 @@ fn unescape_json(s: &str) -> String {
             Some('\\') => out.push('\\'),
             Some('u') => {
                 let hex: String = (0..4).filter_map(|_| it.next()).collect();
-                if let Ok(v) = u32::from_str_radix(&hex, 16) {
-                    if let Some(c) = char::from_u32(v) {
-                        out.push(c);
-                    }
+                if let Ok(v) = u32::from_str_radix(&hex, 16)
+                    && let Some(c) = char::from_u32(v)
+                {
+                    out.push(c);
                 }
             }
             Some(other) => out.push(other),
@@ -368,13 +391,21 @@ fn unescape_json(s: &str) -> String {
 }
 
 fn opt<'a>(args: &'a [String], key: &str) -> Option<&'a str> {
-    args.iter().position(|a| a == key).and_then(|i| args.get(i + 1)).map(|s| s.as_str())
+    args.iter()
+        .position(|a| a == key)
+        .and_then(|i| args.get(i + 1))
+        .map(|s| s.as_str())
 }
 
 fn generate(g: &Gguf, args: &[String]) -> ExitCode {
     use std::time::Instant;
     let num = |k: &str, d: usize| opt(args, k).and_then(|v| v.parse().ok()).unwrap_or(d);
-    let (n_gen, tp, ctx, chunk) = (num("-n", 16), num("--tp", 1), num("--ctx", 4096), num("--chunk", 2048).max(hip::BMAX));
+    let (n_gen, tp, ctx, chunk) = (
+        num("-n", 16),
+        num("--tp", 1),
+        num("--ctx", 4096),
+        num("--chunk", 2048).max(hip::BMAX),
+    );
     let hp = match model::HParams::from_gguf(g) {
         Ok(h) => h,
         Err(e) => {
@@ -383,13 +414,27 @@ fn generate(g: &Gguf, args: &[String]) -> ExitCode {
         }
     };
     let tok = tokenizer::Tokenizer::from_gguf(g).expect("tokenizer");
-    let ids_file = opt(args, "--ids-file").map(|p| std::fs::read_to_string(p).expect("read ids file"));
-    let ids: Vec<u32> = match (ids_file.as_deref().or(opt(args, "--ids")), opt(args, "--prompt")) {
-        (Some(s), _) => s.split(|c: char| !c.is_ascii_digit()).filter_map(|v| v.parse().ok()).collect(),
+    let ids_file =
+        opt(args, "--ids-file").map(|p| std::fs::read_to_string(p).expect("read ids file"));
+    let ids: Vec<u32> = match (
+        ids_file.as_deref().or(opt(args, "--ids")),
+        opt(args, "--prompt"),
+    ) {
+        (Some(s), _) => s
+            .split(|c: char| !c.is_ascii_digit())
+            .filter_map(|v| v.parse().ok())
+            .collect(),
         (_, Some(p)) => tok.encode(p, true),
         _ => return usage(),
     };
-    eprintln!("prompt tokens: {}", if ids.len() <= 64 { format!("{ids:?}") } else { format!("{} ids", ids.len()) });
+    eprintln!(
+        "prompt tokens: {}",
+        if ids.len() <= 64 {
+            format!("{ids:?}")
+        } else {
+            format!("{} ids", ids.len())
+        }
+    );
 
     let mut eng = match build_engine(g, &hp, tp, ctx, 1, num("--draft-vocab", 102400), chunk) {
         Ok(e) => e,
@@ -412,10 +457,18 @@ fn generate(g: &Gguf, args: &[String]) -> ExitCode {
         next = out.last().unwrap().token;
     }
     eng.dump = false;
-    eprintln!("prefill {} tokens in {:.3}s", ids.len(), t1.elapsed().as_secs_f64());
+    eprintln!(
+        "prefill {} tokens in {:.3}s",
+        ids.len(),
+        t1.elapsed().as_secs_f64()
+    );
     if args.iter().any(|a| a == "--dump") {
         let last_chunk = (ids.len() - 1) % chunk + 1;
-        let lg = eng.logits(if last_chunk > hip::BMAX { 0 } else { last_chunk - 1 });
+        let lg = eng.logits(if last_chunk > hip::BMAX {
+            0
+        } else {
+            last_chunk - 1
+        });
         let mut top: Vec<(usize, f32)> = lg.iter().copied().enumerate().collect();
         top.sort_by(|a, b| b.1.total_cmp(&a.1));
         for (id, v) in top.iter().take(10) {
@@ -459,21 +512,45 @@ fn generate(g: &Gguf, args: &[String]) -> ExitCode {
     }
     out_ids.truncate(n_gen);
     if n_draft > 0 {
-        eprintln!("mtp: {steps} steps, acceptance {:.3} ({accepted}/{drafted}), mean tokens/step {:.2}", accepted as f64 / drafted as f64, (accepted + steps) as f64 / steps as f64);
+        eprintln!(
+            "mtp: {steps} steps, acceptance {:.3} ({accepted}/{drafted}), mean tokens/step {:.2}",
+            accepted as f64 / drafted as f64,
+            (accepted + steps) as f64 / steps as f64
+        );
     }
     if let Some(p) = &eng.prof {
         eprintln!("decode profile:");
         p.borrow().report();
     }
     let dt = t2.elapsed().as_secs_f64();
-    eprintln!("decode {} tokens in {:.3}s = {:.2} tok/s", out_ids.len() - 1, dt, (out_ids.len() - 1) as f64 / dt);
-    println!("ids {}", out_ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(","));
+    eprintln!(
+        "decode {} tokens in {:.3}s = {:.2} tok/s",
+        out_ids.len() - 1,
+        dt,
+        (out_ids.len() - 1) as f64 / dt
+    );
+    println!(
+        "ids {}",
+        out_ids
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
     println!("text {:?}", tok.decode(&out_ids));
     ExitCode::SUCCESS
 }
 
 /// Load the model onto `tp` cards and build an engine with one sequence slot.
-fn build_engine(g: &Gguf, hp: &model::HParams, tp: usize, ctx: usize, n_slots: usize, draft_vocab: usize, rows: usize) -> Result<engine::Engine, String> {
+fn build_engine(
+    g: &Gguf,
+    hp: &model::HParams,
+    tp: usize,
+    ctx: usize,
+    n_slots: usize,
+    draft_vocab: usize,
+    rows: usize,
+) -> Result<engine::Engine, String> {
     // The KV pool is addressed in 16-slot tiles and 4096-slot attention segments.
     let ctx = ctx.next_multiple_of(hip::ATTN_SEG_SLOTS);
     let t0 = std::time::Instant::now();
@@ -486,19 +563,17 @@ fn build_engine(g: &Gguf, hp: &model::HParams, tp: usize, ctx: usize, n_slots: u
         let mut wave = [0i32];
         let wb = hip::DevBuf::<i32>::new(1);
         unsafe { hip::pk_wave_size(s, wb.ptr()) };
-        wb.download(&mut wave, s);
+        // SAFETY: pk_wave_size initialized wb; wave stays untouched until sync below.
+        unsafe { wb.download(&mut wave, s) };
         hip::sync(s);
         assert_eq!(wave[0], 32, "kernels assume wave32");
         let sh = model::Shard { rank, n: tp };
         let mut loader = model::Loader::new(g, s);
-        let w = match loader.load(hp, sh, draft_vocab, |l| {
+        let w = loader.load(hp, sh, draft_vocab, |l| {
             if l % 16 == 15 {
                 eprintln!("  rank {rank}: layer {} loaded", l + 1)
             }
-        }) {
-            Ok(w) => w,
-            Err(e) => return Err(e),
-        };
+        })?;
         let st = loader.stats;
         drop(loader);
         let (free, total) = hip::mem_info();
@@ -511,7 +586,18 @@ fn build_engine(g: &Gguf, hp: &model::HParams, tp: usize, ctx: usize, n_slots: u
             free as f64 / (1u64 << 30) as f64,
             total as f64 / (1u64 << 30) as f64
         );
-        ranks.push(engine::Rank::new(rank, s, hp, sh, w, n_slots, ctx, rows));
+        ranks.push(engine::Rank::new(
+            rank,
+            s,
+            hp,
+            sh,
+            w,
+            engine::Capacity {
+                slots: n_slots,
+                kv: ctx,
+                rows,
+            },
+        ));
     }
     let eng = engine::Engine::new(hp.clone(), ranks, n_slots, ctx, rows);
     eprintln!("startup {:.1}s", t0.elapsed().as_secs_f64());
@@ -522,7 +608,9 @@ fn build_engine(g: &Gguf, hp: &model::HParams, tp: usize, ctx: usize, n_slots: u
 fn score(g: &Gguf, args: &[String]) -> ExitCode {
     let num = |k: &str, d: usize| opt(args, k).and_then(|v| v.parse().ok()).unwrap_or(d);
     let (prefix, topk, tp) = (num("--prefix", 1), num("--topk", 20), num("--tp", 1));
-    let Some(path) = opt(args, "--ids-file") else { return usage() };
+    let Some(path) = opt(args, "--ids-file") else {
+        return usage();
+    };
     let ids: Vec<u32> = std::fs::read_to_string(path)
         .expect("read ids file")
         .split(|c: char| !c.is_ascii_digit())
@@ -549,7 +637,10 @@ fn score(g: &Gguf, args: &[String]) -> ExitCode {
                 top.select_nth_unstable_by(topk, |a, b| b.1.total_cmp(&a.1));
                 top.truncate(topk);
                 top.sort_by(|a, b| b.1.total_cmp(&a.1));
-                let items: Vec<String> = top.iter().map(|(i, v)| format!("{i}:{:.5}", *v as f64 - lse)).collect();
+                let items: Vec<String> = top
+                    .iter()
+                    .map(|(i, v)| format!("{i}:{:.5}", *v as f64 - lse))
+                    .collect();
                 println!("{pos} {}", items.join(" "));
             }
             pos += 1;
@@ -559,7 +650,11 @@ fn score(g: &Gguf, args: &[String]) -> ExitCode {
 }
 
 fn chat_template(g: &Gguf) -> Result<chat::ChatTemplate, String> {
-    chat::ChatTemplate::new(g.str_of("tokenizer.chat_template").ok_or("GGUF has no chat template")?.to_string())
+    chat::ChatTemplate::new(
+        g.str_of("tokenizer.chat_template")
+            .ok_or("GGUF has no chat template")?
+            .to_string(),
+    )
 }
 
 fn think_kwargs(args: &[String]) -> serde_json::Map<String, serde_json::Value> {
@@ -571,14 +666,23 @@ fn think_kwargs(args: &[String]) -> serde_json::Map<String, serde_json::Value> {
 }
 
 fn render(g: &Gguf, args: &[String]) -> ExitCode {
-    let Some(text) = args.first() else { return usage() };
+    let Some(text) = args.first() else {
+        return usage();
+    };
     let tmpl = chat_template(g).expect("chat template");
     let tok = tokenizer::Tokenizer::from_gguf(g).expect("tokenizer");
     let msgs = serde_json::json!([{"role": "user", "content": text}]);
     match tmpl.render(&msgs, None, &think_kwargs(args)) {
         Ok(p) => {
             println!("{p}");
-            println!("ids {}", tok.encode(&p, true).iter().map(|i| i.to_string()).collect::<Vec<_>>().join(","));
+            println!(
+                "ids {}",
+                tok.encode(&p, true)
+                    .iter()
+                    .map(|i| i.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -590,13 +694,31 @@ fn render(g: &Gguf, args: &[String]) -> ExitCode {
 
 fn serve(g: &Gguf, args: &[String]) -> ExitCode {
     let num = |k: &str, d: usize| opt(args, k).and_then(|v| v.parse().ok()).unwrap_or(d);
-    let (port, tp, ctx, n_slots, draft_n) = (num("--port", 8996), num("--tp", 2), num("--ctx", 262144), num("--slots", 2), num("--draft", 7));
+    let (port, tp, ctx, n_slots, draft_n) = (
+        num("--port", 8996),
+        num("--tp", 2),
+        num("--ctx", 262144),
+        num("--slots", 2),
+        num("--draft", 7),
+    );
     let chunk = num("--chunk", 2048).max(hip::BMAX);
     let host = opt(args, "--host").unwrap_or("127.0.0.1");
     let hp = model::HParams::from_gguf(g).expect("hparams");
     let tok = tokenizer::Tokenizer::from_gguf(g).expect("tokenizer");
+    if tok.vocab_size() != hp.vocab || hp.vocab > i32::MAX as usize {
+        eprintln!("tokenizer vocabulary does not match the embedding table or kernel range");
+        return ExitCode::FAILURE;
+    }
     let template = chat_template(g).expect("chat template");
-    let eng = match build_engine(g, &hp, tp, ctx, n_slots, num("--draft-vocab", 102400), chunk) {
+    let eng = match build_engine(
+        g,
+        &hp,
+        tp,
+        ctx,
+        n_slots,
+        num("--draft-vocab", 102400),
+        chunk,
+    ) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("load: {e}");
@@ -629,9 +751,21 @@ fn serve(g: &Gguf, args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    eprintln!("listening on http://{host}:{port} (tp {tp}, ctx {ctx}, slots {n_slots}, draft {draft_n})");
+    eprintln!(
+        "listening on http://{host}:{port} (tp {tp}, ctx {ctx}, slots {n_slots}, draft {draft_n})"
+    );
     std::thread::spawn(move || server::serve(listener, shared));
     // The engine stays on this thread: every HIP call comes from one place.
-    sched::Driver::new(eng, tok, n_slots, sched::Config { draft_n, ctx, chunk }).run(rx);
+    sched::Driver::new(
+        eng,
+        tok,
+        n_slots,
+        sched::Config {
+            draft_n,
+            ctx,
+            chunk,
+        },
+    )
+    .run(rx);
     ExitCode::SUCCESS
 }

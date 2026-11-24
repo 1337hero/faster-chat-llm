@@ -45,14 +45,24 @@ impl HParams {
         if arch != "qwen35" {
             return Err(format!("unsupported architecture {arch:?} (need qwen35)"));
         }
-        let u = |k: &str| g.u64_of(&format!("qwen35.{k}")).map(|v| v as usize).ok_or(format!("missing qwen35.{k}"));
-        let f = |k: &str| g.f32_of(&format!("qwen35.{k}")).ok_or(format!("missing qwen35.{k}"));
+        let u = |k: &str| {
+            g.u64_of(&format!("qwen35.{k}"))
+                .map(|v| v as usize)
+                .ok_or(format!("missing qwen35.{k}"))
+        };
+        let f = |k: &str| {
+            g.f32_of(&format!("qwen35.{k}"))
+                .ok_or(format!("missing qwen35.{k}"))
+        };
         let n_rot = u("rope.dimension_count")?;
         let hp = Self {
             n_layer: u("block_count")? - u("nextn_predict_layers").unwrap_or(0),
             d: u("embedding_length")?,
             ff: u("feed_forward_length")?,
-            vocab: g.tensor("token_embd.weight").map_err(|e| e.to_string())?.dims[1] as usize,
+            vocab: g
+                .tensor("token_embd.weight")
+                .map_err(|e| e.to_string())?
+                .dims[1] as usize,
             hq: u("attention.head_count")?,
             hkv: u("attention.head_count_kv")?,
             hd: u("attention.key_length")?,
@@ -66,14 +76,19 @@ impl HParams {
             n_mtp: u("nextn_predict_layers").unwrap_or(0),
         };
         // The kernels hard-code these head sizes.
-        if hp.hd != 256 || hp.gs != 128 || hp.d % 256 != 0 || hp.ff % 256 != 0 || hp.n_mtp > 1 {
+        if hp.hd != 256
+            || hp.gs != 128
+            || !hp.d.is_multiple_of(256)
+            || !hp.ff.is_multiple_of(256)
+            || hp.n_mtp > 1
+        {
             return Err(format!("geometry not supported by the kernels: {hp:?}"));
         }
         Ok(hp)
     }
 
     pub fn is_attn(&self, layer: usize) -> bool {
-        (layer + 1) % self.full_interval == 0
+        (layer + 1).is_multiple_of(self.full_interval)
     }
 }
 
@@ -124,7 +139,7 @@ impl Shard {
     }
 
     fn split(&self, total: usize) -> (usize, usize) {
-        assert!(total % self.n == 0);
+        assert!(total.is_multiple_of(self.n));
         (self.rank * (total / self.n), total / self.n)
     }
 
@@ -141,7 +156,11 @@ impl Shard {
         let s = hp.gs;
         let (k0, kn) = self.split(hp.gk);
         let mut rows = vec![(k0 * s, kn * s), ((hp.gk + k0) * s, kn * s)];
-        rows.extend(self.gdn_v_runs(hp).iter().map(|&(h, n)| ((2 * hp.gk + h) * s, n * s)));
+        rows.extend(
+            self.gdn_v_runs(hp)
+                .iter()
+                .map(|&(h, n)| ((2 * hp.gk + h) * s, n * s)),
+        );
         rows
     }
 }
@@ -155,8 +174,20 @@ pub struct Mat {
 }
 
 pub enum Mixer {
-    Gdn { win: Mat, wout: Mat, conv_w: DevBuf<f32>, dt_bias: DevBuf<f32>, ssm_a: DevBuf<f32>, norm_w: DevBuf<f32> },
-    Attn { win: Mat, wout: Mat, q_norm: DevBuf<f32>, k_norm: DevBuf<f32> },
+    Gdn {
+        win: Mat,
+        wout: Mat,
+        conv_w: DevBuf<f32>,
+        dt_bias: DevBuf<f32>,
+        ssm_a: DevBuf<f32>,
+        norm_w: DevBuf<f32>,
+    },
+    Attn {
+        win: Mat,
+        wout: Mat,
+        q_norm: DevBuf<f32>,
+        k_norm: DevBuf<f32>,
+    },
 }
 
 pub struct LayerW {
@@ -210,25 +241,51 @@ const STAGE_BYTES: usize = 256 << 20;
 
 impl<'a> Loader<'a> {
     pub fn new(g: &'a Gguf, s: Stream) -> Self {
-        Self { g, s, pinned: Pinned::new(STAGE_BYTES), stage: DevBuf::new(STAGE_BYTES), stats: LoadStats::default() }
+        Self {
+            g,
+            s,
+            pinned: Pinned::new(STAGE_BYTES),
+            stage: DevBuf::new(STAGE_BYTES),
+            stats: LoadStats::default(),
+        }
     }
 
     /// Build one device matrix from row ranges of one or more Q8_0 tensors (stacked in order),
     /// keeping only the given column block ranges (empty = all columns).
-    fn mat(&mut self, parts: &[(String, Rows)], col_blocks: &[(usize, usize)]) -> Result<Mat, String> {
+    fn mat(
+        &mut self,
+        parts: &[(String, Rows)],
+        col_blocks: &[(usize, usize)],
+    ) -> Result<Mat, String> {
         let first = self.g.tensor(&parts[0].0).map_err(|e| e.to_string())?;
         let nb_src = first.dims[0] as usize / 32;
         let all = [(0, nb_src)];
-        let col_blocks = if col_blocks.is_empty() { &all[..] } else { col_blocks };
+        let col_blocks = if col_blocks.is_empty() {
+            &all[..]
+        } else {
+            col_blocks
+        };
         let nb_dst: usize = col_blocks.iter().map(|c| c.1).sum();
         let rows: usize = parts.iter().flat_map(|p| p.1.iter()).map(|r| r.1).sum();
-        let mut cr = ColRanges { n: col_blocks.len() as i32, ..Default::default() };
+        let mut cr = ColRanges {
+            n: col_blocks.len() as i32,
+            ..Default::default()
+        };
         for (i, &(s, l)) in col_blocks.iter().enumerate() {
             cr.start[i] = s as i32;
             cr.len[i] = l as i32;
         }
-        assert!(rows % 16 == 0, "{}: {rows} rows is not a whole number of 16-row tiles", parts[0].0);
-        let mat = Mat { qs: DevBuf::new(rows * nb_dst * 32), d: DevBuf::new(rows * nb_dst), rows, cols: nb_dst * 32 };
+        assert!(
+            rows.is_multiple_of(16),
+            "{}: {rows} rows is not a whole number of 16-row tiles",
+            parts[0].0
+        );
+        let mat = Mat {
+            qs: DevBuf::new(rows * nb_dst * 32),
+            d: DevBuf::new(rows * nb_dst),
+            rows,
+            cols: nb_dst * 32,
+        };
 
         let row_bytes = nb_src * 34;
         let rows_per_chunk = STAGE_BYTES / row_bytes;
@@ -236,26 +293,48 @@ impl<'a> Loader<'a> {
         for (name, ranges) in parts {
             let t = self.g.tensor(name).map_err(|e| e.to_string())?;
             if t.ty != GgmlType::Q8_0 {
-                return Err(format!("{name}: {} not supported for matrices (only Q8_0)", t.ty));
+                return Err(format!(
+                    "{name}: {} not supported for matrices (only Q8_0)",
+                    t.ty
+                ));
             }
             if t.dims[0] as usize != nb_src * 32 {
                 return Err(format!("{name}: column count differs from {}", parts[0].0));
             }
             let base = self.g.data_offset + t.offset;
             for &(r0, rn) in ranges {
-                assert!(r0 + rn <= t.dims[1] as usize, "{name}: rows {r0}+{rn} out of range");
+                assert!(
+                    r0 + rn <= t.dims[1] as usize,
+                    "{name}: rows {r0}+{rn} out of range"
+                );
                 let mut done = 0;
                 while done < rn {
                     let n = (rn - done).min(rows_per_chunk);
                     let bytes = n * row_bytes;
                     let t0 = Instant::now();
                     self.g
-                        .pread(base + ((r0 + done) * row_bytes) as u64, &mut self.pinned.as_mut_slice()[..bytes])
+                        .pread(
+                            base + ((r0 + done) * row_bytes) as u64,
+                            &mut self.pinned.as_mut_slice()[..bytes],
+                        )
                         .map_err(|e| format!("{name}: {e}"))?;
                     let t1 = Instant::now();
-                    hip::upload_raw(self.stage.ptr(), self.pinned.as_ptr(), bytes, self.s);
+                    // SAFETY: pread initialized bytes; both buffers remain live and unchanged until sync below.
                     unsafe {
-                        hip::pk_unpack_q8(self.s, self.stage.ptr(), mat.qs.ptr(), mat.d.ptr(), n as i64, nb_src as i32, nb_dst as i32, dst_row as i64, &cr);
+                        hip::upload_raw(self.stage.ptr(), self.pinned.as_ptr(), bytes, self.s)
+                    };
+                    unsafe {
+                        hip::pk_unpack_q8(
+                            self.s,
+                            self.stage.ptr(),
+                            mat.qs.ptr(),
+                            mat.d.ptr(),
+                            n as i64,
+                            nb_src as i32,
+                            nb_dst as i32,
+                            dst_row as i64,
+                            &cr,
+                        );
                     }
                     hip::sync(self.s);
                     self.stats.read += t1 - t0;
@@ -293,7 +372,13 @@ impl<'a> Loader<'a> {
         Ok(DevBuf::from_slice(&out, self.s))
     }
 
-    fn layer(&mut self, hp: &HParams, sh: Shard, l: usize, is_attn: bool) -> Result<LayerW, String> {
+    fn layer(
+        &mut self,
+        hp: &HParams,
+        sh: Shard,
+        l: usize,
+        is_attn: bool,
+    ) -> Result<LayerW, String> {
         let blk = |r: (usize, usize)| (r.0 / 32, r.1 / 32);
         let n = |s: &str| format!("blk.{l}.{s}");
         let mixer = if is_attn {
@@ -309,7 +394,10 @@ impl<'a> Loader<'a> {
                     ],
                     &[],
                 )?,
-                wout: self.mat(&[(n("attn_output.weight"), vec![(0, hp.d)])], &[blk((q0 * hd, qn * hd))])?,
+                wout: self.mat(
+                    &[(n("attn_output.weight"), vec![(0, hp.d)])],
+                    &[blk((q0 * hd, qn * hd))],
+                )?,
                 q_norm: self.vec(&n("attn_q_norm.weight"))?,
                 k_norm: self.vec(&n("attn_k_norm.weight"))?,
             }
@@ -341,12 +429,24 @@ impl<'a> Loader<'a> {
             attn_norm: self.vec(&n("attn_norm.weight"))?,
             post_norm: self.vec(&n("post_attention_norm.weight"))?,
             mixer,
-            upgate: self.mat(&[(n("ffn_up.weight"), vec![f]), (n("ffn_gate.weight"), vec![f])], &[])?,
+            upgate: self.mat(
+                &[
+                    (n("ffn_up.weight"), vec![f]),
+                    (n("ffn_gate.weight"), vec![f]),
+                ],
+                &[],
+            )?,
             down: self.mat(&[(n("ffn_down.weight"), vec![(0, hp.d)])], &[blk(f)])?,
         })
     }
 
-    pub fn load(&mut self, hp: &HParams, sh: Shard, draft_vocab: usize, mut progress: impl FnMut(usize)) -> Result<Weights, String> {
+    pub fn load(
+        &mut self,
+        hp: &HParams,
+        sh: Shard,
+        draft_vocab: usize,
+        mut progress: impl FnMut(usize),
+    ) -> Result<Weights, String> {
         let embd = self.mat(&[("token_embd.weight".into(), vec![(0, hp.vocab)])], &[])?;
         let head = self.mat(&[("output.weight".into(), vec![sh.split(hp.vocab)])], &[])?;
         let out_norm = self.vec("output_norm.weight")?;
@@ -361,7 +461,8 @@ impl<'a> Loader<'a> {
             let per_rank = draft_vocab.min(hp.vocab) / sh.n / 16 * 16;
             let draft_v0 = sh.rank * per_rank;
             Some(MtpW {
-                draft_head: self.mat(&[("output.weight".into(), vec![(draft_v0, per_rank)])], &[])?,
+                draft_head: self
+                    .mat(&[("output.weight".into(), vec![(draft_v0, per_rank)])], &[])?,
                 draft_v0,
                 eh_proj: self.mat(&[(n("eh_proj"), vec![(0, hp.d)])], &[])?,
                 enorm: self.vec(&n("enorm"))?,
@@ -372,6 +473,12 @@ impl<'a> Loader<'a> {
         } else {
             None
         };
-        Ok(Weights { embd, head, out_norm, layers, mtp })
+        Ok(Weights {
+            embd,
+            head,
+            out_norm,
+            layers,
+            mtp,
+        })
     }
 }

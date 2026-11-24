@@ -8,7 +8,7 @@ pub mod types;
 
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Read};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
@@ -205,6 +205,12 @@ impl Gguf {
             .and_then(|v| v.as_u64())
             .unwrap_or(32);
 
+        if !alignment.is_power_of_two() {
+            return Err(GgufError::BadGeometry(format!(
+                "invalid GGUF alignment: {alignment}"
+            )));
+        }
+
         let mut tensors = Vec::with_capacity(n_tensors as usize);
         for _ in 0..n_tensors {
             let name = c.string()?;
@@ -229,7 +235,10 @@ impl Gguf {
         }
 
         let header_end = c.pos as u64;
-        let data_offset = header_end.div_ceil(alignment) * alignment;
+        let data_offset = header_end
+            .checked_add(alignment - 1)
+            .map(|end| end & !(alignment - 1))
+            .ok_or_else(|| GgufError::BadGeometry("GGUF alignment overflow".into()))?;
         if data_offset > file_len {
             return Err(GgufError::Truncated {
                 at: header_end,
@@ -285,28 +294,6 @@ impl Gguf {
         Ok(())
     }
 
-    /// Stream a tensor's bytes in `chunk`-sized pieces, calling `f(offset_in_tensor, slice)`.
-    /// This is how weights get to the cards without ever holding the tensor in host memory.
-    pub fn stream_tensor(
-        &self,
-        name: &str,
-        chunk: usize,
-        mut f: impl FnMut(u64, &[u8]) -> Result<(), GgufError>,
-    ) -> Result<u64, GgufError> {
-        let info = self.tensor(name)?;
-        let total = info.n_bytes();
-        let start = self.data_offset + info.offset;
-        let mut buf = vec![0u8; chunk];
-        let mut done = 0u64;
-        while done < total {
-            let n = (total - done).min(chunk as u64) as usize;
-            self.file.read_exact_at(&mut buf[..n], start + done)?;
-            f(done, &buf[..n])?;
-            done += n as u64;
-        }
-        Ok(total)
-    }
-
     pub fn file_len(&self) -> Result<u64, GgufError> {
         Ok(self.file.metadata()?.len())
     }
@@ -339,15 +326,6 @@ impl Gguf {
         }
     }
 
-    pub fn array_u32(&self, key: &str) -> Option<Vec<u32>> {
-        match self.meta.get(key) {
-            Some(MetaValue::Array { items, .. }) => {
-                items.iter().map(|v| v.as_u64().map(|x| x as u32)).collect()
-            }
-            _ => None,
-        }
-    }
-
     /// Sanity check the tensor table against the file length.
     pub fn validate_layout(&self) -> Result<(), GgufError> {
         let file_len = self.file_len()?;
@@ -362,9 +340,4 @@ impl Gguf {
         }
         Ok(())
     }
-}
-
-/// Rewind helper kept for callers that read the file directly.
-pub fn rewind(f: &mut File) -> io::Result<u64> {
-    f.seek(SeekFrom::Start(0))
 }
