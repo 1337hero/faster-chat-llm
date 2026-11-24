@@ -18,7 +18,7 @@ pub const MAX_GROUPS: usize = 4;
 pub const BMAX: usize = 16;
 /// Decode attention segment length in cache slots, and floats per segment partial (see kernels.cpp).
 pub const ATTN_SEG_SLOTS: usize = 16 * 16;
-pub const ATTN_PART: usize = 16 * 256 + 32;
+pub const ATTN_PART: usize = 16 * 256 + 32 * 4;
 /// Prefill attention sweeps the cache in stretches of this many slots: K and V of one stretch
 /// (2 KiB per slot per rank at TP2) stay inside the card's cache while every row tile uses them.
 pub const ATTN_SWEEP_SLOTS: usize = 2048;
