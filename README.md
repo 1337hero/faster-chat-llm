@@ -63,8 +63,8 @@ What is built and verified:
 - **262,144-token context** shared by two slots: needle retrieval 3/3 at 130,728 and at 259,231
   tokens, and two concurrent 131K-token requests both retrieve 3/3.
 - **HTTP server** speaking OpenAI chat / completions / Responses, Anthropic Messages and
-  llama-server's native endpoints, with tool-call parsing. Smoke-tested; not yet exercised
-  against the official SDKs.
+  llama-server's native endpoints, with tool-call parsing. Exercised with the official OpenAI
+  and Anthropic Python SDKs: chat, streaming, tool-call round trips, Responses, thinking.
 
 Measured on this hardware against llama.cpp serving the same GGUF on the same two cards
 (tensor split + MTP drafts; greedy, thinking off, medians of a fixed six-prompt panel, baseline
@@ -72,10 +72,11 @@ run before and after):
 
 | | llama.cpp | faster-chat-llm |
 |---|---:|---:|
-| Decode, 1 stream (tok/s) | 67.8 | 77.1 to 79.1 |
+| Decode, 1 stream (tok/s) | 67.8 | 77.1 to 79.3 |
 | Decode, 2 streams, aggregate (tok/s) | 127.0 | 157.4 to 164.8 |
 | Prefill at ~2.8K / ~21.5K prompt tokens (tok/s) | 1555 / 1675 | 1870 to 1997 / 1759 to 1781 |
-| Prefill at 131K / 259K prompt tokens (tok/s) | 1153 / 801 | 1357 / 1021 |
+| Prefill at 131K / 259K prompt tokens (tok/s) | 1104 to 1153 / 801 | 1346 to 1391 / 1021 to 1029 |
+| Decode at 131K context, 400-token answers (tok/s) | 40.2 | 43.9 to 44.2 |
 | Time to first token, 19-token prompt | 185 ms | 87 ms |
 | Time to first token, 42 / 262 / 942-token prompt | 176 / 294 / 669 ms | 123 / 242 / 545 ms |
 | Start to ready, warm page cache | 12.5 to 14 s | 7 to 8 s |
