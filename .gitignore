@@ -1,7 +1,34 @@
+# build artifacts
 target/
+*.o
+*.a
+
+# compiled harness binaries (sources stay)
+/bench/bench_hw
+/bench/bench_rccl
+/quality/prestlo-v0
+
+# experiment outputs and scaffolding
+/runs/
+runs-*.log
+/quality/
+/configs/
+*.log
+*.pid
+
+# python
+__pycache__/
+*.pyc
+
+# local harness settings (machine-local permissions)
+.claude/settings.local.json
+
+# weights
 *.gguf
 
+# research notes, not product
 PROMPT.md
 PLAN.md
-MODEL_CARD.md
 THEORY.md
+MODEL_CARD.md
+ledger.jsonl
