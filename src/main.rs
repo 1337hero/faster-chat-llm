@@ -29,6 +29,7 @@ usage: faster-chat-llm <command> <gguf> [args]
               --slots 2         concurrent sequences
               --draft 7         MTP drafts per decode step (0 = off)
               --draft-vocab K   draft over the first K token ids (default 102400)
+              --chunk 2048      prefill rows per step
               --no-think        default enable_thinking to false
   gen       greedy generation from a raw prompt
               --prompt TEXT | --ids 1,2,3    -n N    --tp N    --ctx N    --chunk N
@@ -369,7 +370,7 @@ fn opt<'a>(args: &'a [String], key: &str) -> Option<&'a str> {
 fn generate(g: &Gguf, args: &[String]) -> ExitCode {
     use std::time::Instant;
     let num = |k: &str, d: usize| opt(args, k).and_then(|v| v.parse().ok()).unwrap_or(d);
-    let (n_gen, tp, ctx, chunk) = (num("-n", 16), num("--tp", 1), num("--ctx", 4096), num("--chunk", hip::BMAX).min(hip::BMAX));
+    let (n_gen, tp, ctx, chunk) = (num("-n", 16), num("--tp", 1), num("--ctx", 4096), num("--chunk", 2048).max(hip::BMAX));
     let hp = match model::HParams::from_gguf(g) {
         Ok(h) => h,
         Err(e) => {
@@ -385,7 +386,7 @@ fn generate(g: &Gguf, args: &[String]) -> ExitCode {
     };
     eprintln!("prompt tokens: {ids:?}");
 
-    let mut eng = match build_engine(g, &hp, tp, ctx, 1, num("--draft-vocab", 102400)) {
+    let mut eng = match build_engine(g, &hp, tp, ctx, 1, num("--draft-vocab", 102400), chunk) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("load: {e}");
@@ -393,6 +394,10 @@ fn generate(g: &Gguf, args: &[String]) -> ExitCode {
         }
     };
 
+    let profile = args.iter().any(|a| a == "--profile");
+    if profile {
+        eng.prof = Some(std::cell::RefCell::new(engine::Prof::new()));
+    }
     let t1 = Instant::now();
     let mut next = 0u32;
     let n_chunks = ids.chunks(chunk).count();
@@ -404,7 +409,8 @@ fn generate(g: &Gguf, args: &[String]) -> ExitCode {
     eng.dump = false;
     eprintln!("prefill {} tokens in {:.3}s", ids.len(), t1.elapsed().as_secs_f64());
     if args.iter().any(|a| a == "--dump") {
-        let lg = eng.logits(ids.len().saturating_sub(1) % chunk);
+        let last_chunk = (ids.len() - 1) % chunk + 1;
+        let lg = eng.logits(if last_chunk > hip::BMAX { 0 } else { last_chunk - 1 });
         let mut top: Vec<(usize, f32)> = lg.iter().copied().enumerate().collect();
         top.sort_by(|a, b| b.1.total_cmp(&a.1));
         for (id, v) in top.iter().take(10) {
@@ -412,7 +418,9 @@ fn generate(g: &Gguf, args: &[String]) -> ExitCode {
         }
     }
 
-    if args.iter().any(|a| a == "--profile") {
+    if profile {
+        eprintln!("prefill profile:");
+        eng.prof.as_ref().unwrap().borrow().report();
         eng.prof = Some(std::cell::RefCell::new(engine::Prof::new()));
     }
     let t2 = Instant::now();
@@ -449,6 +457,7 @@ fn generate(g: &Gguf, args: &[String]) -> ExitCode {
         eprintln!("mtp: {steps} steps, acceptance {:.3} ({accepted}/{drafted}), mean tokens/step {:.2}", accepted as f64 / drafted as f64, (accepted + steps) as f64 / steps as f64);
     }
     if let Some(p) = &eng.prof {
+        eprintln!("decode profile:");
         p.borrow().report();
     }
     let dt = t2.elapsed().as_secs_f64();
@@ -459,7 +468,9 @@ fn generate(g: &Gguf, args: &[String]) -> ExitCode {
 }
 
 /// Load the model onto `tp` cards and build an engine with one sequence slot.
-fn build_engine(g: &Gguf, hp: &model::HParams, tp: usize, ctx: usize, n_slots: usize, draft_vocab: usize) -> Result<engine::Engine, String> {
+fn build_engine(g: &Gguf, hp: &model::HParams, tp: usize, ctx: usize, n_slots: usize, draft_vocab: usize, rows: usize) -> Result<engine::Engine, String> {
+    // The KV pool is addressed in 16-slot tiles and 4096-slot attention segments.
+    let ctx = ctx.next_multiple_of(hip::ATTN_SEG_SLOTS);
     let t0 = std::time::Instant::now();
     let n_dev = hip::init();
     assert!(tp <= n_dev, "need {tp} devices, HIP sees {n_dev}");
@@ -495,9 +506,9 @@ fn build_engine(g: &Gguf, hp: &model::HParams, tp: usize, ctx: usize, n_slots: u
             free as f64 / (1u64 << 30) as f64,
             total as f64 / (1u64 << 30) as f64
         );
-        ranks.push(engine::Rank::new(rank, s, hp, sh, w, n_slots, ctx));
+        ranks.push(engine::Rank::new(rank, s, hp, sh, w, n_slots, ctx, rows));
     }
-    let eng = engine::Engine::new(hp.clone(), ranks, n_slots, ctx);
+    let eng = engine::Engine::new(hp.clone(), ranks, n_slots, ctx, rows);
     eprintln!("startup {:.1}s", t0.elapsed().as_secs_f64());
 
     Ok(eng)
@@ -514,7 +525,7 @@ fn score(g: &Gguf, args: &[String]) -> ExitCode {
         .collect();
     let ctx = num("--ctx", ids.len() + 16);
     let hp = model::HParams::from_gguf(g).expect("hparams");
-    let mut eng = match build_engine(g, &hp, tp, ctx, 1, num("--draft-vocab", 102400)) {
+    let mut eng = match build_engine(g, &hp, tp, ctx, 1, num("--draft-vocab", 102400), hip::BMAX) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("load: {e}");
@@ -575,11 +586,12 @@ fn render(g: &Gguf, args: &[String]) -> ExitCode {
 fn serve(g: &Gguf, args: &[String]) -> ExitCode {
     let num = |k: &str, d: usize| opt(args, k).and_then(|v| v.parse().ok()).unwrap_or(d);
     let (port, tp, ctx, n_slots, draft_n) = (num("--port", 8996), num("--tp", 2), num("--ctx", 262144), num("--slots", 2), num("--draft", 7));
+    let chunk = num("--chunk", 2048).max(hip::BMAX);
     let host = opt(args, "--host").unwrap_or("127.0.0.1");
     let hp = model::HParams::from_gguf(g).expect("hparams");
     let tok = tokenizer::Tokenizer::from_gguf(g).expect("tokenizer");
     let template = chat_template(g).expect("chat template");
-    let eng = match build_engine(g, &hp, tp, ctx, n_slots, num("--draft-vocab", 102400)) {
+    let eng = match build_engine(g, &hp, tp, ctx, n_slots, num("--draft-vocab", 102400), chunk) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("load: {e}");
@@ -615,6 +627,6 @@ fn serve(g: &Gguf, args: &[String]) -> ExitCode {
     eprintln!("listening on http://{host}:{port} (tp {tp}, ctx {ctx}, slots {n_slots}, draft {draft_n})");
     std::thread::spawn(move || server::serve(listener, shared));
     // The engine stays on this thread: every HIP call comes from one place.
-    sched::Driver::new(eng, tok, n_slots, sched::Config { draft_n, ctx }).run(rx);
+    sched::Driver::new(eng, tok, n_slots, sched::Config { draft_n, ctx, chunk }).run(rx);
     ExitCode::SUCCESS
 }

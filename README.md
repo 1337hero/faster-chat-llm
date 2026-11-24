@@ -39,13 +39,55 @@ at load time.
 
 ## Status
 
-Bring-up. The GGUF loader is verified tensor-for-tensor against an independent parser, the TP1
-forward pass lands inside upstream llama.cpp's own cross-backend deviation envelope, and the
-engine generates and serves. TP2, the MTP draft head, and the fast kernels are in progress.
+Working engine for one model: Qwen3.8-27B Q8_0 (`qwen35`, hybrid Gated DeltaNet + full
+attention, one MTP layer) at tensor-parallel 2 on two Radeon AI PRO R9700 (gfx1201).
 
-Current model support: Qwen3.8-27B (`qwen35`, hybrid Gated DeltaNet + full attention, one MTP
-layer). Measurement history and rejected ideas live in `PLAN.md` and `ledger.jsonl`; nothing here
-is a performance claim yet.
+What is built and verified:
+
+- **Loader.** Reads the GGUF directly and streams tensors to the cards; checked
+  tensor-for-tensor against an independent parser. Q8_0 weights are used as stored.
+- **Kernels.** Q8_0 matmul on the int8 matrix core, Gated DeltaNet, gated attention on the f16
+  matrix core. A token computes the same bits alone, in a verify batch, or beside another
+  sequence.
+- **Two-card exchange that runs on the cards.** Decode-sized steps trade partial sums through
+  coherent pinned host memory with no host round trip (8.5 µs per 20 KB hop, single process).
+- **Lossless speculative decode** with the GGUF's own MTP head: drafts are verified against the
+  full model, rollback is replay-based, and output is token-identical to non-speculative decode
+  on every prompt checked.
+- **262,144-token context** shared by two slots: needle retrieval 3/3 at 130,728 and at 259,231
+  tokens, and two concurrent 131K-token requests both retrieve 3/3.
+- **HTTP server** speaking OpenAI chat / completions / Responses, Anthropic Messages and
+  llama-server's native endpoints, with tool-call parsing. Smoke-tested; not yet exercised
+  against the official SDKs.
+
+Measured on this hardware against llama.cpp serving the same GGUF on the same two cards
+(tensor split + MTP drafts; greedy, thinking off, medians of a fixed six-prompt panel, baseline
+run before and after):
+
+| | llama.cpp | faster-chat-llm |
+|---|---:|---:|
+| Decode, 1 stream (tok/s) | 67.5 | 75.1 to 76.6 |
+| Decode, 2 streams, aggregate (tok/s) | 126.3 | 152.5 |
+| Prefill at ~2.8K / ~21.5K prompt tokens (tok/s) | 1550 / 1668 | 1822 / 1717 |
+| Prefill at 131K / 259K prompt tokens (tok/s) | 1148 / 799 | 990 to 1075 / 730 |
+| Time to first token, 19-token prompt | 184 ms | 87 ms |
+| Start to ready | ~22 s | ~8 s |
+
+Agreement with upstream llama.cpp on the same GGUF, teacher-forced over 2,991 positions: the
+top token matches 99.67% of the time and top-20 KL averages 0.00021. Two llama.cpp backends
+compared the same way agree 99.50% with KL 0.00020, so the engine sits at llama.cpp's own
+build-to-build spread.
+
+Known gaps:
+
+- Slower than llama.cpp on prefill beyond ~100K tokens (6 to 14%) and on time to first token
+  for prompts of roughly 80 to 500 tokens (13 to 25%).
+- A stream's decode slows while the other slot prefills a long prompt (35 tok/s measured
+  beside a 131K-token prefill).
+- One model, one quantisation (Q8_0 + F32), one GPU family. No vision. Sampling other than
+  greedy runs on the host. `logprobs` are not implemented.
+- Nowhere near goal 1 yet: that needs a stronger drafter than the MTP head, which is opt-in
+  territory under goal 3.
 
 ## Build
 
@@ -55,6 +97,9 @@ Requires ROCm 7.x with `hipcc` available (default `/opt/rocm`, override with `RO
 cargo build --release
 ./target/release/faster-chat-llm serve <model.gguf> --port 8996
 ```
+
+`cargo build --profile fast` is the iteration build: it drops LTO so a host-side edit relinks in
+well under a second (the kernels are compiled the same either way).
 
 Arch selection is currently hardcoded to `gfx1201` in `build.rs`; the `libr4d` / `libr3d` split
 above is where that becomes a real choice.

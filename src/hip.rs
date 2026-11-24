@@ -8,6 +8,7 @@ use std::ffi::{CStr, c_char, c_int, c_void};
 use std::marker::PhantomData;
 
 pub type Stream = *mut c_void;
+pub type Event = *mut c_void;
 
 const HOST_TO_DEVICE: c_int = 1;
 const DEVICE_TO_HOST: c_int = 2;
@@ -15,6 +16,12 @@ const DEVICE_TO_DEVICE: c_int = 3;
 
 pub const MAX_GROUPS: usize = 4;
 pub const BMAX: usize = 16;
+/// Decode attention segment length in cache slots, and floats per segment partial (see kernels.cpp).
+pub const ATTN_SEG_SLOTS: usize = 16 * 16;
+pub const ATTN_PART: usize = 16 * 256 + 32;
+/// Prefill attention sweeps the cache in stretches of this many slots: K and V of one stretch
+/// (2 KiB per slot per rank at TP2) stay inside the card's cache while every row tile uses them.
+pub const ATTN_SWEEP_SLOTS: usize = 2048;
 
 /// Mirrors `PkGroups` in kernels.cpp.
 #[repr(C)]
@@ -53,8 +60,12 @@ unsafe extern "C" {
     fn hipHostFree(ptr: *mut c_void) -> c_int;
     fn hipMemcpyAsync(dst: *mut c_void, src: *const c_void, size: usize, kind: c_int, s: Stream) -> c_int;
     fn hipMemsetAsync(dst: *mut c_void, value: c_int, size: usize, s: Stream) -> c_int;
+    fn hipMemcpyPeerAsync(dst: *mut c_void, dst_dev: c_int, src: *const c_void, src_dev: c_int, size: usize, s: Stream) -> c_int;
     fn hipStreamCreate(s: *mut Stream) -> c_int;
     fn hipStreamSynchronize(s: Stream) -> c_int;
+    fn hipEventCreate(e: *mut Event) -> c_int;
+    fn hipEventRecord(e: Event, s: Stream) -> c_int;
+    fn hipEventSynchronize(e: Event) -> c_int;
     fn hipMemGetInfo(free: *mut usize, total: *mut usize) -> c_int;
     fn hipGetErrorString(e: c_int) -> *const c_char;
 }
@@ -63,13 +74,14 @@ unsafe extern "C" {
     pub fn pk_wave_size(s: Stream, out: *mut i32);
     pub fn pk_unpack_q8(s: Stream, raw: *const u8, qs: *mut i8, d: *mut u16, n_rows: i64, nb_src: i32, nb_dst: i32, dst_row0: i64, cr: *const ColRanges);
     pub fn pk_embed(s: Stream, qs: *const i8, d: *const u16, tokens: *const i32, h: *mut f32, dim: i32, b: i32);
-    pub fn pk_norm_quant(s: Stream, h: *mut f32, p0: *const f32, p1: *const f32, w: *const f32, eps: f32, dim: i32, b: i32, xq: *mut i8, xd: *mut f32, x_stride: i32, xf: *mut f32);
-    pub fn pk_gemm(s: Stream, w: *const i8, wd: *const u16, xq: *const i8, xd: *const f32, y: *mut f32, rows: i64, cols: i32, b: i32, y_stride: i32);
-    pub fn pk_ffn_act(s: Stream, y: *const f32, f: i32, b: i32, xq: *mut i8, xd: *mut f32);
-    pub fn pk_gdn_conv(s: Stream, yin: *const f32, nin: i32, mix: *mut f32, qkv: *mut f32, r: i32, conv_w: *const f32, dt_bias: *const f32, ssm_a: *const f32, hk: i32, hv: i32, eps: f32, b: i32, g: *const Groups);
-    pub fn pk_gdn_step(s: Stream, state: *mut f32, qkv: *const f32, r: i32, yin: *const f32, nin: i32, norm_w: *const f32, hk: i32, hv: i32, eps: f32, xq: *mut i8, xd: *mut f32, g: *const Groups);
-    pub fn pk_attn_prep(s: Stream, yin: *const f32, nin: i32, hq: i32, hkv: i32, u0: i32, kv_off: i32, q_norm_w: *const f32, k_norm_w: *const f32, eps: f32, theta_scale: f32, n_rot: i32, qr: *mut f32, kc: *mut u16, vc: *mut u16, b: i32, g: *const Groups);
-    pub fn pk_attn(s: Stream, qr: *const f32, yin: *const f32, nin: i32, hq: i32, hkv: i32, kc: *const u16, vc: *const u16, scores: *mut f32, score_stride: i64, xq: *mut i8, xd: *mut f32, b: i32, g: *const Groups);
+    pub fn pk_norm_quant(s: Stream, h: *mut f32, p0: *const f32, p1: *const f32, w: *const f32, eps: f32, dim: i32, b: i32, xq: *mut i8, xd: *mut f32, xs: i32, e_off: i32, xf: *mut f32);
+    pub fn pk_gemm(s: Stream, w: *const i8, wd: *const u16, xq: *const i8, xd: *const f32, xs: i32, b_off: i32, y: *mut f32, rows: i64, cols: i32, b: i32, y_stride: i32);
+    pub fn pk_ffn_act(s: Stream, y: *const f32, f: i32, b: i32, xq: *mut i8, xd: *mut f32, xs: i32);
+    pub fn pk_gdn_conv(s: Stream, yin: *const f32, nin: i32, mix: *mut f32, qkv: *mut f32, r: i32, conv_w: *const f32, dt_bias: *const f32, ssm_a: *const f32, hk: i32, hv: i32, eps: f32, mix_s: *mut f32, qkv_s: *mut f32, b: i32, g: *const Groups);
+    pub fn pk_gdn_step(s: Stream, state: *mut f32, qkv: *const f32, r: i32, yin: *const f32, nin: i32, norm_w: *const f32, hk: i32, hv: i32, eps: f32, xq: *mut i8, xd: *mut f32, xs: i32, qkv_s: *const f32, g: *const Groups);
+    pub fn pk_attn_prep(s: Stream, yin: *const f32, nin: i32, hq: i32, hkv: i32, u0: i32, kv_off: i32, q_norm_w: *const f32, k_norm_w: *const f32, eps: f32, theta_scale: f32, n_rot: i32, qr: *mut u16, kc: *mut u16, vc: *mut u16, b: i32, g: *const Groups);
+    pub fn pk_attn(s: Stream, qr: *const u16, yin: *const f32, nin: i32, hq: i32, hkv: i32, kc: *const u16, vc: *const u16, seg_tiles: i32, part: *mut f32, tiles: i32, segs: i32, xq: *mut i8, xd: *mut f32, xs: i32, b: i32, g: *const Groups);
+    pub fn pk_attn_swept(s: Stream, qr: *const u16, yin: *const f32, nin: i32, hq: i32, hkv: i32, kc: *const u16, vc: *const u16, seg_tiles: i32, seg_first: i32, seg_last: i32, part: *mut f32, tiles: i32, xq: *mut i8, xd: *mut f32, xs: i32, b: i32, g: *const Groups);
     pub fn pk_xchg(s: Stream, own: *const f32, host_out: *mut f32, my_flags: *mut i64, host_in: *const f32, peer_flags: *const i64, peer: *mut f32, n: i32, seq: i64, err: *mut i32);
     pub fn pk_pick(s: Stream, own: *const i32, peer: *const i32, own_v0: i32, peer_v0: i32, tokens: *mut i32, hist: *mut i32, b: i32);
     pub fn pk_argmax(s: Stream, logits: *const f32, n: i64, stride: i64, b: i32, out: *mut i32);
@@ -100,6 +112,21 @@ pub fn stream_create() -> Stream {
     let mut s = std::ptr::null_mut();
     unsafe { ck(hipStreamCreate(&mut s)) };
     s
+}
+
+pub fn event_create() -> Event {
+    let mut e = std::ptr::null_mut();
+    unsafe { ck(hipEventCreate(&mut e)) };
+    e
+}
+
+/// Mark the current tail of stream `s`; `event_wait` returns once everything before it is done.
+pub fn event_record(e: Event, s: Stream) {
+    unsafe { ck(hipEventRecord(e, s)) }
+}
+
+pub fn event_wait(e: Event) {
+    unsafe { ck(hipEventSynchronize(e)) }
 }
 
 pub fn sync(s: Stream) {
@@ -169,6 +196,14 @@ impl<T> Drop for DevBuf<T> {
     fn drop(&mut self) {
         unsafe { hipFree(self.ptr as *mut c_void) };
     }
+}
+
+/// Copy `n` elements from one card's buffer to another's, queued on `s` (the source's stream).
+///
+/// # Safety
+/// Both ranges must lie inside live allocations of the named devices.
+pub unsafe fn copy_peer<T>(dst: *mut T, dst_dev: usize, src: *const T, src_dev: usize, n: usize, s: Stream) {
+    unsafe { ck(hipMemcpyPeerAsync(dst as *mut c_void, dst_dev as c_int, src as *const c_void, src_dev as c_int, n * size_of::<T>(), s)) }
 }
 
 /// Page-locked host staging memory.

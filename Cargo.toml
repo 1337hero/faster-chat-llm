@@ -15,3 +15,11 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 panic = "abort"
+
+# Iteration builds: the host side only orchestrates kernels, so it gives up LTO and
+# single-unit codegen for a relink measured in a second or two.
+[profile.fast]
+inherits = "release"
+lto = "off"
+codegen-units = 16
+incremental = true

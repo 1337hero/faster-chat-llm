@@ -59,9 +59,14 @@ struct Slot {
     active: Option<Active>,
 }
 
+/// Prefill rows per step while another slot is decoding.
+const SHARED_CHUNK: usize = 256;
+
 pub struct Config {
     pub draft_n: usize,
     pub ctx: usize,
+    /// Prefill rows per engine step.
+    pub chunk: usize,
 }
 
 pub struct Driver {
@@ -104,21 +109,30 @@ impl Driver {
     }
 
     /// Place a job on an idle slot, reusing the slot's state when it is a prefix of the prompt.
+    /// The KV pool is shared, so other idle slots give up their cached prefix if the prompt
+    /// would not fit otherwise.
     fn admit(&mut self, job: Job) {
-        let used: usize = self.slots.iter().map(|s| s.cached.len()).sum();
         let reusable = |s: &Slot| s.cached.len() < job.prompt.len() && job.prompt.starts_with(&s.cached);
         let idle = || self.slots.iter().enumerate().filter(|(_, s)| s.active.is_none());
         // Longest reusable prefix first; otherwise evict the idle slot holding the least.
         let pick = idle().filter(|(_, s)| reusable(s)).max_by_key(|(_, s)| s.cached.len()).or_else(|| idle().min_by_key(|(_, s)| s.cached.len()));
         let (i, slot) = pick.expect("admit called without an idle slot");
         let keep = if reusable(slot) { slot.cached.len() } else { 0 };
-        if job.prompt.is_empty() || used - slot.cached.len() + job.prompt.len() + 1 > self.cfg.ctx {
-            let _ = job.tx.send(Event::Done(Done { finish_reason: "length", prompt_tokens: job.prompt.len(), cached_tokens: 0, completion_tokens: 0, prefill_s: 0.0, decode_s: 0.0, drafted: 0, accepted: 0 }));
-            return;
-        }
         if keep == 0 {
             self.eng.reset(i);
             self.slots[i].cached.clear();
+        }
+        let need = job.prompt.len() + 1;
+        let others = |slots: &[Slot]| slots.iter().enumerate().filter(|&(j, _)| j != i).map(|(_, s)| s.cached.len()).sum::<usize>();
+        for j in 0..self.slots.len() {
+            if j != i && self.slots[j].active.is_none() && others(&self.slots) + need > self.cfg.ctx {
+                self.eng.reset(j);
+                self.slots[j].cached.clear();
+            }
+        }
+        if job.prompt.is_empty() || others(&self.slots) + need > self.cfg.ctx {
+            let _ = job.tx.send(Event::Done(Done { finish_reason: "length", prompt_tokens: job.prompt.len(), cached_tokens: 0, completion_tokens: 0, prefill_s: 0.0, decode_s: 0.0, drafted: 0, accepted: 0 }));
+            return;
         }
         let rng = Rng::new(job.sampling.seed);
         self.slots[i].active = Some(Active { job, fed: keep, cached_tokens: keep, last: None, n_gen: 0, rng, pending: Vec::new(), text: String::new(), sent: 0, t0: Instant::now(), t_first: None, drafted: 0, accepted: 0 });
@@ -132,22 +146,24 @@ impl Driver {
         let do_prefill = !prefilling.is_empty() && (decoding.is_empty() || self.prefill_turn);
         self.prefill_turn = !self.prefill_turn;
         if do_prefill {
-            self.prefill(prefilling[0]);
+            // Beside a decoding slot, prefill in short steps: each one stalls the decoder.
+            self.prefill(prefilling[0], if decoding.is_empty() { self.cfg.chunk } else { self.cfg.chunk.min(SHARED_CHUNK) });
         } else if !decoding.is_empty() {
             self.decode(&decoding);
         }
     }
 
-    fn prefill(&mut self, i: usize) {
+    fn prefill(&mut self, i: usize, max_rows: usize) {
         let a = self.slots[i].active.as_ref().unwrap();
-        let chunk: Vec<u32> = a.job.prompt[a.fed..(a.fed + BMAX).min(a.job.prompt.len())].to_vec();
+        let chunk: Vec<u32> = a.job.prompt[a.fed..(a.fed + max_rows).min(a.job.prompt.len())].to_vec();
         let out = self.eng.step(&[(i, &chunk, true)]);
         let slot = &mut self.slots[i];
         slot.cached.extend(&chunk);
         let a = slot.active.as_mut().unwrap();
         a.fed += chunk.len();
         if a.fed == a.job.prompt.len() {
-            let row = chunk.len() - 1;
+            // The engine scores every row of a small batch but only the last row of a large one.
+            let row = out.len() - 1;
             let tok = if a.job.sampling.greedy() { out[row].token } else { sample(&self.eng.logits(row), &a.job.sampling, &mut a.rng) };
             a.t_first = Some(Instant::now());
             self.emit(i, &[tok], 0);
